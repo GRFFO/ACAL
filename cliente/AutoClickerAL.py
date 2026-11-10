@@ -32,7 +32,7 @@ GITHUB_REPO = "GRFFO/ACAL"   # <- cambia esto: usuario/repositorio
 GITHUB_RAMA = "main"
 SERVIDOR = "http://TU-IP:TU-PUERTO"         # respaldo si GitHub no responde
 APP_NOMBRE = "AutoClicker AL"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 ES_WINDOWS = platform.system() == "Windows"
 
 
@@ -881,7 +881,7 @@ class Toast:
         c.create_text(px(22), H / 2, text=ico, fill=col, font=F(12, "bold"))
         c.create_text(px(42), H / 2, text=msg, fill=TEXTO, font=F(10), anchor="w")
         c.place(relx=0.5, y=-px(60), anchor="n")
-        c.lift()
+        tk.Misc.tkraise(c)  # (en un Canvas, .lift() mueve dibujos, no la ventana)
         self.c = c
 
         def irse():
@@ -893,7 +893,7 @@ class Toast:
     def arriba(self):
         try:
             if self.c is not None:
-                self.c.lift()
+                tk.Misc.tkraise(self.c)
         except tk.TclError:
             pass
 
@@ -1229,13 +1229,27 @@ def leer_entero(texto, minimo, maximo, nombre):
     return v
 
 
+def registrar_error(texto):
+    """Guarda errores en %APPDATA%\\AutoClickerAL\\errores.log para poder revisarlos."""
+    try:
+        base = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "AutoClickerAL")
+        os.makedirs(base, exist_ok=True)
+        with open(os.path.join(base, "errores.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] v{APP_VERSION}\n{texto}\n")
+    except Exception:
+        pass
+
+
 def seguro(fn):
     """Envuelve callbacks que pueden llegar cuando la pantalla ya se cerro."""
     def w(*a, **k):
         try:
             return fn(*a, **k)
-        except tk.TclError:
-            pass
+        except tk.TclError as e:
+            # si el widget sigue vivo, no es "pantalla cerrada": es un error real
+            if "invalid command name" not in str(e) and "bad window path" not in str(e):
+                import traceback
+                registrar_error(traceback.format_exc())
     return w
 
 
@@ -2437,6 +2451,15 @@ del "%~f0"
 ''')
         subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)
         self.cerrar()
+
+    def report_callback_exception(self, exc, val, tb):
+        import traceback
+        texto = "".join(traceback.format_exception(exc, val, tb))
+        registrar_error(texto)
+        try:
+            self.toast.mostrar(f"Error: {val}"[:110], "error", 5000)
+        except Exception:
+            pass
 
     def _icono(self):
         try:
