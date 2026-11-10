@@ -15,6 +15,24 @@ import AutoClickerAL as A
 A.leer_config_remota = lambda: {"servidor": "http://127.0.0.1:8799", "version": A.APP_VERSION}
 
 ERRORES = []
+_orig_llamar = A.ClienteAPI.llamar
+def llamar_log(self, m, r, d=None):
+    t0 = time.time(); print(f"[api] -> {m} {r} hilo={threading.current_thread().name}", flush=True)
+    try:
+        res = _orig_llamar(self, m, r, d); print(f"[api] <- {r} OK {time.time()-t0:.2f}s", flush=True); return res
+    except Exception as e:
+        print(f"[api] <- {r} ERROR {e!r} {time.time()-t0:.2f}s", flush=True); raise
+A.ClienteAPI.llamar = llamar_log
+_orig_resolver = A.App._resolver
+def resolver_log(self, ok, val, es_error, err):
+    print(f"[ui] resolver error={es_error} ok={getattr(ok,'__name__',ok)}", flush=True)
+    return _orig_resolver(self, ok, val, es_error, err)
+A.App._resolver = resolver_log
+_orig_entrar = A.App.entrar
+def entrar_log(self, *a, **k):
+    print(f"[ui] entrar pantalla={type(self.pantalla).__name__}", flush=True)
+    return _orig_entrar(self, *a, **k)
+A.App.entrar = entrar_log
 def reportar(exc, val, tb):
     ERRORES.append("".join(traceback.format_exception(exc, val, tb)))
     print("ERROR EN CALLBACK:\n" + ERRORES[-1], flush=True)
@@ -33,8 +51,11 @@ def paso(nombre, fn):
         fn()
     except Exception:
         reportar(*sys.exc_info())
-    bombear(2.5)
-    print("    pantalla:", type(app.pantalla).__name__, flush=True)
+    bombear(6)
+    p = app.pantalla
+    print("    pantalla:", type(p).__name__, "cola_ui:", app.cola_ui.qsize(), flush=True)
+    if isinstance(p, A.PantallaAuth):
+        print("    boton:", p.btn.texto, "| error:", p.lbl_error.cget("text"), flush=True)
 
 bombear(3)
 s = app.pantalla
