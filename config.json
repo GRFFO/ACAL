@@ -1,7 +1,7 @@
 {
   "servidor": "http://fi18.bot-hosting.cloud:26369",
-  "version": "2.1",
+  "version": "2.2",
   "obligatoria": false,
   "anuncio": "",
-  "notas": "Corrige el error que dejaba el programa en 'Conectando...' al crear cuenta o iniciar sesión."
+  "notas": "Clics que funcionan en Roblox y otros juegos (Modo juego). Protección: se detiene solo si algo se traba, con F8 o llevando el mouse a la esquina superior izquierda."
 }
