@@ -1,7 +1,7 @@
 {
   "servidor": "http://fi18.bot-hosting.cloud:26369",
-  "version": "2.0",
+  "version": "2.1",
   "obligatoria": false,
   "anuncio": "",
-  "notas": "Primera versión: autoclicker de mouse y teclado, cuentas, licencias y panel de administración."
+  "notas": "Corrige el error que dejaba el programa en 'Conectando...' al crear cuenta o iniciar sesión."
 }
