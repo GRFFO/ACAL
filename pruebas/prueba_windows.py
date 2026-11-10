@@ -33,6 +33,14 @@ def entrar_log(self, *a, **k):
     print(f"[ui] entrar pantalla={type(self.pantalla).__name__}", flush=True)
     return _orig_entrar(self, *a, **k)
 A.App.entrar = entrar_log
+def seguro_log(fn):
+    def w(*a, **k):
+        try:
+            return fn(*a, **k)
+        except A.tk.TclError:
+            reportar(*sys.exc_info())
+    return w
+A.seguro = seguro_log
 def reportar(exc, val, tb):
     ERRORES.append("".join(traceback.format_exception(exc, val, tb)))
     print("ERROR EN CALLBACK:\n" + ERRORES[-1], flush=True)
