@@ -1,0 +1,8 @@
+# datos privados del servidor (NUNCA subirlos)
+servidor/.env
+servidor/datos.db*
+# archivos de compilacion
+build/
+dist/
+*.spec
+__pycache__/

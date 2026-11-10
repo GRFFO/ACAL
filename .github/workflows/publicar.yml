@@ -1,0 +1,81 @@
+name: Publicar version
+
+# Se ejecuta solo cuando publicas una Release en GitHub (ej. etiqueta v2.1)
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  exe:
+    name: Compilar AutoClickerAL.exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Poner version y repositorio en el programa
+        shell: python
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          import os, re
+          v = os.environ["TAG"].lstrip("vV")
+          p = "cliente/AutoClickerAL.py"
+          s = open(p, encoding="utf-8").read()
+          s = re.sub(r'APP_VERSION = "[^"]*"', f'APP_VERSION = "{v}"', s, count=1)
+          s = re.sub(r'GITHUB_REPO = "[^"]*"', f'GITHUB_REPO = "{os.environ["REPO"]}"', s, count=1)
+          open(p, "w", encoding="utf-8").write(s)
+          print("Version", v, "repo", os.environ["REPO"])
+
+      - name: Instalar dependencias
+        run: pip install pillow pyinstaller
+
+      - name: Compilar
+        run: pyinstaller --onefile --noconsole --name AutoClickerAL cliente/AutoClickerAL.py
+
+      - name: Subir el .exe a la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/AutoClickerAL.exe --clobber
+
+  config:
+    name: Avisar a los programas de la nueva version
+    needs: exe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Actualizar config.json
+        shell: python
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          NOTAS: ${{ github.event.release.body }}
+        run: |
+          import json, os
+          with open("config.json", encoding="utf-8") as f:
+              c = json.load(f)
+          c["version"] = os.environ["TAG"].lstrip("vV")
+          c["notas"] = (os.environ.get("NOTAS") or "").strip()[:400]
+          with open("config.json", "w", encoding="utf-8") as f:
+              json.dump(c, f, indent=2, ensure_ascii=False)
+              f.write("\n")
+
+      - name: Guardar cambios
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "config.json: version ${{ github.event.release.tag_name }}" || echo "Sin cambios"
+          git push
