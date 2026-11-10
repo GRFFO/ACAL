@@ -17,3 +17,5 @@ jobs:
           python-version: "3.12"
       - run: pip install pillow
       - run: python pruebas/prueba_windows.py
+        env:
+          PYTHONIOENCODING: utf-8
