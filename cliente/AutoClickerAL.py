@@ -283,7 +283,8 @@ if ES_WINDOWS:
             return
         # Modo juego (Roblox, etc.): los juegos leen el mouse una vez por cuadro (~16 ms).
         # Un clic "instantaneo" (bajar y subir en el mismo milisegundo) se pierde, asi que:
-        # 1) se manda un movimiento real a la posicion, 2) se mantiene presionado ~30 ms.
+        # 1) se manda un movimiento real a la posicion, 2) se mantiene presionado ~40 ms
+        #    (cubre juegos a 30 FPS o mas).
         esperar = parar.wait if parar else time.sleep
         x, y = pos if pos else posicion_cursor()
         _mover_absoluto(x, y)
@@ -293,7 +294,7 @@ if ES_WINDOWS:
                 esperar(0.045)
             _enviar([_mi(d)])
             try:
-                esperar(0.03)
+                esperar(0.04)
             finally:
                 _enviar([_mi(u)])
 

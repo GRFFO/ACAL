@@ -39,7 +39,7 @@ def contar(modo_juego, n=10, doble=False):
 n, dur, m = contar(True)
 print("modo juego -> clics:", n, "duraciones ms:", dur)
 comprobar(n == 10, f"modo juego: llegaron {n}/10 clics")
-comprobar(dur and min(dur) >= 20, f"modo juego: el boton se mantiene presionado >=20 ms (min {min(dur) if dur else '-'})")
+comprobar(dur and min(dur) >= 30, f"modo juego: el boton se mantiene presionado >=30 ms (min {min(dur) if dur else '-'})")
 n, dur, m = contar(True, 5, doble=True)
 comprobar(n == 10, f"modo juego doble clic: llegaron {n}/10 pulsaciones")
 n, dur, m = contar(False)
