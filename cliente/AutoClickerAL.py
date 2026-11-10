@@ -32,7 +32,7 @@ GITHUB_REPO = "GRFFO/ACAL"   # <- cambia esto: usuario/repositorio
 GITHUB_RAMA = "main"
 SERVIDOR = "http://TU-IP:TU-PUERTO"         # respaldo si GitHub no responde
 APP_NOMBRE = "AutoClicker AL"
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 ES_WINDOWS = platform.system() == "Windows"
 
 
@@ -242,6 +242,8 @@ if ES_WINDOWS:
     user32.MapVirtualKeyW.restype = wintypes.UINT
     user32.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
     user32.GetCursorPos.argtypes = (ctypes.POINTER(wintypes.POINT),)
+    user32.GetSystemMetrics.argtypes = (ctypes.c_int,)
+    user32.GetSystemMetrics.restype = ctypes.c_int
 
     _MOUSE = {"izq": (0x0002, 0x0004), "der": (0x0008, 0x0010), "med": (0x0020, 0x0040)}
 
@@ -261,11 +263,39 @@ if ES_WINDOWS:
         i.ki = KEYBDINPUT(vk, scan, flags, 0, 0)
         return i
 
-    def hacer_clic(boton="izq", doble=False, pos=None):
-        if pos:
-            user32.SetCursorPos(int(pos[0]), int(pos[1]))
+    def _mover_absoluto(x, y):
+        """Movimiento REAL del mouse (los juegos lo ven; SetCursorPos no siempre)."""
+        vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
+        vw, vh = max(2, user32.GetSystemMetrics(78)), max(2, user32.GetSystemMetrics(79))
+        nx = int(round((x - vx) * 65535 / (vw - 1)))
+        ny = int(round((y - vy) * 65535 / (vh - 1)))
+        i = INPUT()
+        i.type = 0
+        i.mi = MOUSEINPUT(nx, ny, 0, 0x0001 | 0x8000 | 0x4000, 0, 0)  # MOVE | ABSOLUTE | VIRTUALDESK
+        _enviar([i])
+
+    def hacer_clic(boton="izq", doble=False, pos=None, modo_juego=True, parar=None):
         d, u = _MOUSE[boton]
-        _enviar([_mi(d), _mi(u)] * (2 if doble else 1))
+        if not modo_juego:
+            if pos:
+                user32.SetCursorPos(int(pos[0]), int(pos[1]))
+            _enviar([_mi(d), _mi(u)] * (2 if doble else 1))
+            return
+        # Modo juego (Roblox, etc.): los juegos leen el mouse una vez por cuadro (~16 ms).
+        # Un clic "instantaneo" (bajar y subir en el mismo milisegundo) se pierde, asi que:
+        # 1) se manda un movimiento real a la posicion, 2) se mantiene presionado ~30 ms.
+        esperar = parar.wait if parar else time.sleep
+        x, y = pos if pos else posicion_cursor()
+        _mover_absoluto(x, y)
+        esperar(0.008)
+        for n in range(2 if doble else 1):
+            if n:
+                esperar(0.045)
+            _enviar([_mi(d)])
+            try:
+                esperar(0.03)
+            finally:
+                _enviar([_mi(u)])
 
     def presionar_tecla(vk, mantener_ms=25, parar=None):
         scan = user32.MapVirtualKeyW(vk, 0)
@@ -303,6 +333,9 @@ else:
     def hacer_clic(*_a, **_k):
         raise RuntimeError("Los clics solo funcionan en Windows")
 
+    def _mover_absoluto(_x, _y):
+        pass
+
     presionar_tecla = hacer_clic
 
     def posicion_cursor():
@@ -318,6 +351,8 @@ class Motor:
         self.activo, self.contador = False, 0
         self.inicio = self.fin = 0.0
         self.error, self.completado = None, False
+        self.ultimo = time.monotonic()   # ultima vez que el hilo dio señales de vida
+        self.intervalo = 0.1
 
     def iniciar(self, accion, intervalo, repeticiones=0):
         if self.activo:
@@ -325,9 +360,12 @@ class Motor:
         self._parar.clear()
         self.contador, self.error, self.completado = 0, None, False
         self.inicio, self.fin, self.activo = time.time(), 0.0, True
+        self.ultimo, self.intervalo = time.monotonic(), intervalo
         threading.Thread(target=self._loop, args=(accion, intervalo, repeticiones), daemon=True).start()
 
-    def detener(self):
+    def detener(self, motivo=None):
+        if motivo and self.activo and not self.error:
+            self.error = motivo
         self._parar.set()
 
     def _loop(self, accion, intervalo, rep):
@@ -335,6 +373,7 @@ class Motor:
             prox = time.perf_counter()
             while not self._parar.is_set():
                 accion(self._parar)
+                self.ultimo = time.monotonic()
                 self.contador += 1
                 if rep and self.contador >= rep:
                     self.completado = True
@@ -345,6 +384,7 @@ class Motor:
                     prox = time.perf_counter()
                 elif resto > 0:
                     self._parar.wait(resto)
+                self.ultimo = time.monotonic()
         except Exception as e:
             self.error = str(e)
         finally:
@@ -352,20 +392,77 @@ class Motor:
 
 
 class VigilanteAtajos(threading.Thread):
-    def __init__(self, cola):
+    """Hilo independiente de la ventana: atajos globales + PROTECCION.
+
+    Aunque la ventana se congele, este hilo sigue funcionando y puede detener todo:
+      - Tecla de emergencia (F8): detiene al instante, sin pasar por la ventana.
+      - Esquina de emergencia: mouse en la esquina superior izquierda = detener todo.
+      - Accion trabada: si un clic/tecla no termina a tiempo, se detiene ese motor.
+      - Ventana congelada: si la interfaz deja de responder, se detiene todo.
+    """
+
+    def __init__(self, cola, motores):
         super().__init__(daemon=True)
-        self.cola, self.atajos, self.habilitado, self._prev = cola, {}, False, {}
+        self.cola, self.motores = cola, motores
+        self.atajos, self.habilitado, self._prev = {}, False, {}
+        self.esquina = True
+        self.vigia = True
+        self.latido_ui = time.monotonic()
+        self._esquina_antes = False
+        self._ultima_revision = 0.0
+
+    def detener_todo(self, motivo):
+        hubo = False
+        for m in self.motores.values():
+            if m.activo:
+                hubo = True
+                m.detener(motivo)
+        return hubo
+
+    def _revisar_proteccion(self):
+        ahora = time.monotonic()
+        activos = [m for m in self.motores.values() if m.activo]
+        # 1) esquina de emergencia
+        if self.esquina:
+            x, y = posicion_cursor()
+            vx = user32.GetSystemMetrics(76) if ES_WINDOWS else 0
+            vy = user32.GetSystemMetrics(77) if ES_WINDOWS else 0
+            en_esquina = x <= vx + 2 and y <= vy + 2
+            if en_esquina and not self._esquina_antes and activos:
+                self.detener_todo("Parada de emergencia: mouse en la esquina")
+                self.cola.put("proteccion")
+            self._esquina_antes = en_esquina
+        if not self.vigia or not activos or ahora - self._ultima_revision < 0.5:
+            return
+        self._ultima_revision = ahora
+        # 2) ventana congelada
+        if ahora - self.latido_ui > 4.0:
+            self.detener_todo("La ventana dejó de responder; se detuvo todo por seguridad")
+            return
+        # 3) accion trabada
+        for m in activos:
+            limite = max(5.0, m.intervalo * 2 + 3.0)
+            if ahora - m.ultimo > limite:
+                m.detener("Una acción se trabó; se detuvo por seguridad")
+                self.cola.put("proteccion")
 
     def run(self):
         while True:
-            if self.habilitado:
-                for nombre, vk in list(self.atajos.items()):
-                    ab = tecla_abajo(vk)
-                    if ab and not self._prev.get(nombre):
-                        self.cola.put(nombre)
-                    self._prev[nombre] = ab
-            else:
-                self._prev.clear()
+            try:
+                if self.habilitado:
+                    for nombre, vk in list(self.atajos.items()):
+                        ab = tecla_abajo(vk)
+                        if ab and not self._prev.get(nombre):
+                            if nombre == "stop":
+                                # se detiene aqui mismo: funciona aunque la ventana este trabada
+                                self.detener_todo(None)
+                            self.cola.put(nombre)
+                        self._prev[nombre] = ab
+                else:
+                    self._prev.clear()
+                self._revisar_proteccion()
+            except Exception:
+                pass
             time.sleep(0.02)
 
 
@@ -1533,6 +1630,8 @@ class PaginaClicker(Pagina):
         self.lbl_cps = self._stat(st, "Por seg.", "0.0")
         self.lbl_atajo = etiqueta(pc, "", 9, ACENTO2, "bold")
         self.lbl_atajo.pack(pady=(px(12), 0))
+        self.lbl_emerg = etiqueta(pc, "", 8, SUB, justify="center")
+        self.lbl_emerg.pack(pady=(px(4), 0))
         self.refrescar_atajo()
         self._mostrado, self._estaba = 0, False
         card = Tarjeta(self.cuerpo, pad=20)
@@ -1548,7 +1647,12 @@ class PaginaClicker(Pagina):
         return l
 
     def refrescar_atajo(self):
-        self.lbl_atajo.config(text=f"Atajo:  {nombre_vk(self.app.ajustes()[self.atajo])}")
+        aj = self.app.ajustes()
+        self.lbl_atajo.config(text=f"Atajo:  {nombre_vk(aj[self.atajo])}")
+        txt = f"Emergencia: {nombre_vk(aj['hk_stop'])}"
+        if aj.get("esquina", True):
+            txt += "\no mouse a la esquina ↖"
+        self.lbl_emerg.config(text=txt)
 
     def fila_intervalo(self):
         der = self.fila(self.card, "Intervalo", "milisegundos")
@@ -1618,6 +1722,11 @@ class PaginaMouse(PaginaClicker):
         self.b_punto.pack(side="left", padx=(px(8), 0))
         self._pos(self.s_pos.get())
         self.fila_repetir()
+        der = self.fila(self.card, "Modo juego", "Roblox y otros juegos")
+        self.t_juego = Interruptor(der, cfg.get("juego", True))
+        self.t_juego.pack(side="left")
+        etiqueta(der, "Clics que los juegos sí detectan.\nApágalo solo si quieres la máxima velocidad.",
+                 8, justify="left").pack(side="left", padx=(px(10), 0))
 
     def _pos(self, i):
         self.b_punto.set_texto(f"⌖ {self.punto[0]}, {self.punto[1]}" if i == 1 else "—")
@@ -1645,11 +1754,13 @@ class PaginaMouse(PaginaClicker):
         boton = ["izq", "der", "med"][self.s_boton.get()]
         doble = self.s_tipo.get() == 1
         pos = self.punto if self.s_pos.get() == 1 else None
-        return (lambda _p: hacer_clic(boton, doble, pos)), iv, rep
+        juego = self.t_juego.get()
+        return (lambda p: hacer_clic(boton, doble, pos, juego, p)), iv, rep
 
     def obtener_config(self):
         d = self.config_base()
-        d.update(boton=self.s_boton.get(), tipo=self.s_tipo.get(), pos=self.s_pos.get(), punto=list(self.punto))
+        d.update(boton=self.s_boton.get(), tipo=self.s_tipo.get(), pos=self.s_pos.get(), punto=list(self.punto),
+                 juego=self.t_juego.get())
         return d
 
 
@@ -2094,6 +2205,16 @@ class PaginaCuenta(Pagina):
         f.pack(fill="x", pady=(px(14), 0))
         etiqueta(f, "Ventana siempre encima", 10, TEXTO).pack(side="left")
         Interruptor(f, app.ajustes()["encima"], command=self._encima).pack(side="right")
+        etiqueta(d, "PROTECCIÓN", 8, ACENTO2, "bold").pack(anchor="w", pady=(px(16), px(2)))
+        for clave, txt, ayuda in (("esquina", "Esquina de emergencia", "Mouse a la esquina superior izquierda = parar"),
+                                  ("vigia", "Parar si algo se traba", "Detiene todo si un clic o la ventana se congela")):
+            f = tk.Frame(d, bg=PANEL)
+            f.pack(fill="x", pady=px(4))
+            t = tk.Frame(f, bg=PANEL)
+            t.pack(side="left")
+            etiqueta(t, txt, 10, TEXTO).pack(anchor="w")
+            etiqueta(t, ayuda, 8).pack(anchor="w")
+            Interruptor(f, app.ajustes()[clave], command=lambda v, c=clave: self._proteccion(c, v)).pack(side="right")
         Boton(d, "Cerrar sesión", app.cerrar_sesion, ancho=250, alto=40,
               color=mezclar(PANEL, ERROR, 0.7)).pack(side="bottom")
 
@@ -2122,6 +2243,11 @@ class PaginaCuenta(Pagina):
     def _set(self, k, v):
         self.app.ajustes()[k] = v
         self.app.local.guardar()
+
+    def _proteccion(self, clave, v):
+        self._set(clave, v)
+        self.app.aplicar_atajos()
+        self.principal.refrescar_atajos()
 
     def _encima(self, v):
         self._set("encima", v)
@@ -2300,7 +2426,8 @@ class PantallaPrincipal(tk.Frame):
 
 
 # ═════════════════════════════ APLICACION ═════════════════════════════════
-AJUSTES_DEF = {"hk_mouse": 0x75, "hk_teclado": 0x76, "hk_stop": 0x77, "retraso": 2, "encima": False}
+AJUSTES_DEF = {"hk_mouse": 0x75, "hk_teclado": 0x76, "hk_stop": 0x77, "retraso": 2, "encima": False,
+               "esquina": True, "vigia": True}
 
 
 class App(tk.Tk):
@@ -2331,7 +2458,7 @@ class App(tk.Tk):
         self.motores = {"mouse": Motor(), "teclado": Motor()}
         self.cola_atajos = queue.Queue()
         self.cola_ui = queue.Queue()
-        self.vigilante = VigilanteAtajos(self.cola_atajos)
+        self.vigilante = VigilanteAtajos(self.cola_atajos, self.motores)
         self.vigilante.start()
         self.protocol("WM_DELETE_WINDOW", self.cerrar)
         self.bind_all("<MouseWheel>", self._rueda)
@@ -2583,6 +2710,8 @@ del "%~f0"
     def aplicar_atajos(self):
         aj = self.ajustes()
         self.vigilante.atajos = {"mouse": aj["hk_mouse"], "teclado": aj["hk_teclado"], "stop": aj["hk_stop"]}
+        self.vigilante.esquina = bool(aj.get("esquina", True))
+        self.vigilante.vigia = bool(aj.get("vigia", True))
 
     def guardar_config(self):
         if self.yo and isinstance(self.pantalla, PantallaPrincipal):
@@ -2591,6 +2720,7 @@ del "%~f0"
 
     # --- bucle de la interfaz ---
     def _tick(self):
+        self.vigilante.latido_ui = time.monotonic()  # "la ventana sigue viva"
         try:
             while not self.cola_ui.empty():
                 ok, val, es_err, err = self.cola_ui.get_nowait()
@@ -2606,7 +2736,12 @@ del "%~f0"
                 self.vigilante.habilitado = not p.capturando()
                 while not self.cola_atajos.empty():
                     ev = self.cola_atajos.get_nowait()
-                    p.detener_todo() if ev == "stop" else p.alternar(ev)
+                    if ev == "stop":
+                        p.detener_todo()
+                    elif ev == "proteccion":
+                        p.detener_todo(False)  # el aviso con el motivo lo muestra cada pagina
+                    else:
+                        p.alternar(ev)
                 p.actualizar()
             else:
                 while not self.cola_atajos.empty():
