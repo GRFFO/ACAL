@@ -1055,6 +1055,40 @@ class Tarjeta(tk.Frame):
         f.create_line(w - 1, r, w - 1, h - r, fill=self.borde)
 
 
+class TarjetaFlotante:
+    """Tarjeta dibujada directamente sobre el fondo animado.
+
+    Tk no tiene transparencia entre widgets: una Tarjeta normal dejaria esquinas del
+    color de fondo liso encima de las luces. Aqui el panel redondeado se pinta en el
+    mismo lienzo del fondo (con transparencia real) y solo el contenido es un Frame.
+    """
+
+    def __init__(self, fondo, pad=30, radio=16):
+        self.fondo, self.pad, self.r = fondo, px(pad), px(radio)
+        self.cuerpo = tk.Frame(fondo.master, bg=PANEL)
+        self._item, self._tam, self._foto = None, None, None
+        self.cuerpo.bind("<Configure>", self._ajustar)
+
+    def place(self, **kw):
+        self.cuerpo.place(**kw)
+
+    def place_configure(self, **kw):
+        self.cuerpo.place_configure(**kw)
+
+    def _ajustar(self, e):
+        x, y = e.x - self.pad, e.y - self.pad
+        tam = (e.width + 2 * self.pad, e.height + 2 * self.pad)
+        if tam != self._tam:
+            self._tam = tam
+            self._foto = img_rr(tam[0], tam[1], self.r, fill=PANEL, outline=BORDE)
+            if self._item is None:
+                self._item = self.fondo.create_image(x, y, image=self._foto, anchor="nw", tags="tarjeta")
+            else:
+                self.fondo.itemconfigure(self._item, image=self._foto)
+        self.fondo.coords(self._item, x, y)
+        self.fondo.tag_raise("tarjeta")
+
+
 class Toast:
     def __init__(self, root):
         self.root, self.c, self.anim = root, None, Anim(root)
@@ -1111,6 +1145,7 @@ class FondoAnimado(Lienzo):
             w, h = max(1, self.winfo_width()), max(1, self.winfo_height())
             if not self.items:
                 self.items = [self.img(0, 0, img_glow(o["r"], o["c"]), anchor="center") for o in self.orbes]
+                self.tag_raise("tarjeta")
             for o, it in zip(self.orbes, self.items):
                 o["x"] += o["vx"]
                 o["y"] += o["vy"]
@@ -1532,8 +1567,9 @@ class PantallaAuth(tk.Frame):
     def __init__(self, app):
         super().__init__(app, bg=BG)
         self.app, self.anim = app, Anim(self)
-        FondoAnimado(self).place(x=0, y=0, relwidth=1, relheight=1)
-        self.card = Tarjeta(self, pad=30)
+        fondo = FondoAnimado(self)
+        fondo.place(x=0, y=0, relwidth=1, relheight=1)
+        self.card = TarjetaFlotante(fondo, pad=30)
         self.card.place(relx=0.5, rely=0.5, anchor="center")
         c = self.card.cuerpo
 
@@ -1661,8 +1697,9 @@ class PantallaLicencia(tk.Frame):
     def __init__(self, app, aviso=""):
         super().__init__(app, bg=BG)
         self.app, self.anim = app, Anim(self)
-        FondoAnimado(self).place(x=0, y=0, relwidth=1, relheight=1)
-        self.card = Tarjeta(self, pad=32)
+        fondo = FondoAnimado(self)
+        fondo.place(x=0, y=0, relwidth=1, relheight=1)
+        self.card = TarjetaFlotante(fondo, pad=32)
         self.card.place(relx=0.5, rely=0.5, anchor="center")
         c = self.card.cuerpo
         self.candado = Candado(c)
