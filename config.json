@@ -1,7 +1,7 @@
 {
   "servidor": "http://fi18.bot-hosting.cloud:26369",
-  "version": "2.2",
+  "version": "2.3",
   "obligatoria": false,
   "anuncio": "",
-  "notas": "Clics que funcionan en Roblox y otros juegos (Modo juego). Protección: se detiene solo si algo se traba, con F8 o llevando el mouse a la esquina superior izquierda."
+  "notas": "Versión pulida: arranque instantáneo, respuestas más rápidas, clicker más preciso, modo juego en el teclado, cambiar contraseña y muchas correcciones."
 }
