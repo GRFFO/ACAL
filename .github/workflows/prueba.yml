@@ -1,24 +1,39 @@
-name: Prueba en Windows
+name: Pruebas
 
 on:
   workflow_dispatch:
   push:
     paths:
       - "cliente/**"
+      - "servidor/**"
       - "pruebas/**"
+      - ".github/workflows/prueba.yml"
 
 jobs:
-  prueba:
+  servidor:
+    name: Servidor (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python pruebas/prueba_servidor.py
+
+  windows:
+    name: Programa (Windows)
     runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install pillow
-      - run: python pruebas/prueba_windows.py
-        env:
-          PYTHONIOENCODING: utf-8
-      - run: python pruebas/prueba_clics.py
-        env:
-          PYTHONIOENCODING: utf-8
+      - name: Servidor
+        run: python pruebas/prueba_servidor.py
+      - name: Pantallas y flujo completo
+        run: python pruebas/prueba_windows.py
+      - name: Clics reales, precisión y protecciones
+        run: python pruebas/prueba_clics.py

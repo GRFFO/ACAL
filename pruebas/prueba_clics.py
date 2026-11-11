@@ -45,6 +45,46 @@ comprobar(n == 10, f"modo juego doble clic: llegaron {n}/10 pulsaciones")
 n, dur, m = contar(False)
 comprobar(n == 10, f"modo rapido: llegaron {n}/10 clics")
 
+# ---------- 1b) teclado en modo juego: la tecla se mantiene ~40 ms ----------
+teclas = []
+root.bind("<KeyPress-a>", lambda e: teclas.append(("down", e.time)))
+root.bind("<KeyRelease-a>", lambda e: teclas.append(("up", e.time)))
+root.focus_force(); root.update()
+for _ in range(5):
+    A.presionar_tecla(0x41, 40)
+    time.sleep(0.05)
+    root.update()
+for _ in range(20):
+    root.update(); time.sleep(0.01)
+downs = [t for k, t in teclas if k == "down"]
+ups = [t for k, t in teclas if k == "up"]
+dur = [u - d for d, u in zip(downs, ups)]
+comprobar(len(downs) >= 5, f"teclado: llegaron {len(downs)}/5 pulsaciones")
+comprobar(dur and min(dur) >= 30, f"teclado modo juego: tecla mantenida >=30 ms (duraciones {dur})")
+
+# ---------- 1c) precision del ritmo ----------
+def medir_ritmo(intervalo, carga=False):
+    parar = threading.Event()
+    def ocupar():   # simula la ventana dibujando animaciones al mismo tiempo
+        while not parar.is_set():
+            sum(i * i for i in range(2000))
+    if carga:
+        threading.Thread(target=ocupar, daemon=True).start()
+    m = A.Motor()
+    m.iniciar(lambda p: None, intervalo)
+    time.sleep(2.0)
+    m.detener()
+    parar.set()
+    time.sleep(0.05)
+    return m.contador / 2.0
+
+for iv, carga in ((0.010, False), (0.005, False), (0.002, False), (0.010, True), (0.005, True)):
+    esperado = 1 / iv
+    real = medir_ritmo(iv, carga)
+    error = abs(real - esperado) / esperado
+    comprobar(error < 0.05, f"ritmo {iv*1000:.0f} ms{' con la ventana ocupada' if carga else ''}: "
+                            f"{real:.0f}/s (esperado {esperado:.0f}, error {error*100:.1f} %)")
+
 # ---------- 2) protecciones ----------
 cola = __import__("queue").Queue()
 motores = {"mouse": A.Motor(), "teclado": A.Motor()}

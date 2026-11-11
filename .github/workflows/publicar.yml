@@ -37,6 +37,13 @@ jobs:
       - name: Instalar dependencias
         run: pip install pillow pyinstaller
 
+      - name: Pruebas (si algo falla, no se publica)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python pruebas/prueba_servidor.py
+          python pruebas/prueba_windows.py
+
       - name: Compilar
         run: pyinstaller --onefile --noconsole --name AutoClickerAL cliente/AutoClickerAL.py
 

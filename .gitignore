@@ -6,3 +6,6 @@ build/
 dist/
 *.spec
 __pycache__/
+
+# respaldos automaticos de la base de datos
+servidor/respaldos/

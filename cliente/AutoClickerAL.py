@@ -5,11 +5,12 @@ AutoClicker AL - autoclicker de mouse y teclado con cuentas y licencias en linea
 Requisitos: Windows 10/11, Python 3.9+ y Pillow  (pip install pillow)
 Ejecutar:   python AutoClickerAL.py
 
-La direccion del servidor se pone en SERVIDOR (abajo) o en un archivo
-"servidor.txt" junto al programa/.exe (si existe, tiene prioridad).
+La direccion del servidor se toma de config.json en GitHub (GITHUB_REPO). Un archivo
+"servidor.txt" junto al programa/.exe tiene prioridad (util para pruebas).
 """
 
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -17,23 +18,28 @@ import platform
 import queue
 import random
 import re
+import socket
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
 from collections import OrderedDict
 from datetime import datetime
+from urllib.parse import urlsplit
 
 # ════════════════════════════ CONFIGURACION ════════════════════════════
 # Repositorio de GitHub (publico) donde esta config.json. Desde ahi se controla
 # la direccion del servidor, la version y los anuncios, sin recompilar el .exe.
 GITHUB_REPO = "GRFFO/ACAL"   # <- cambia esto: usuario/repositorio
 GITHUB_RAMA = "main"
-SERVIDOR = "http://TU-IP:TU-PUERTO"         # respaldo si GitHub no responde
+SERVIDOR = "http://fi18.bot-hosting.cloud:26369"   # respaldo si GitHub no responde
 APP_NOMBRE = "AutoClicker AL"
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 ES_WINDOWS = platform.system() == "Windows"
+
+# Los hilos se turnan cada 1 ms (por defecto 5 ms): el clicker no se retrasa
+# aunque la ventana este dibujando animaciones al mismo tiempo.
+sys.setswitchinterval(0.001)
 
 
 def carpeta_app():
@@ -86,29 +92,88 @@ class ErrorAPI(Exception):
 
 
 class ClienteAPI:
+    """Habla con el servidor reutilizando la misma conexion (evita abrir una por peticion)."""
+
+    INACTIVA = 12          # s sin uso antes de abrir otra (el servidor cierra a los 20)
+    _CAIDAS = (http.client.RemoteDisconnected, http.client.CannotSendRequest,
+               ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
     def __init__(self):
-        self.url = url_servidor()
+        self.token = None
+        self.url = ""
+        self._dest = None
+        self._conn = None
+        self._uso = 0.0
+        self._lock = threading.Lock()
+        self.usar(url_servidor())
 
     def usar(self, url):
-        self.url = url
-        self.token = None
-
-    def llamar(self, metodo, ruta, datos=None):
-        cuerpo = json.dumps(datos).encode() if datos is not None else None
-        req = urllib.request.Request(self.url + ruta, data=cuerpo, method=metodo, headers={
-            "Content-Type": "application/json", "Authorization": f"Bearer {self.token or ''}",
-            "User-Agent": f"AutoClickerAL/{APP_VERSION}"})
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                return json.loads(r.read() or b"{}")
-        except urllib.error.HTTPError as e:
+            p = urlsplit(url)
+            dest = (p.scheme, p.hostname or "", p.port or (443 if p.scheme == "https" else 80), p.path.rstrip("/"))
+        except ValueError:      # direccion mal escrita: cada llamada dara "sin conexion"
+            dest = ("http", "", 0, "")
+        with self._lock:
+            if dest != self._dest:
+                self._cerrar()
+                self._dest = dest
+        self.url = url
+
+    def _cerrar(self):
+        if self._conn is not None:
             try:
-                msg = json.loads(e.read()).get("error") or f"Error {e.code}"
+                self._conn.close()
             except Exception:
-                msg = f"Error del servidor ({e.code})"
-            raise ErrorAPI(msg, e.code)
-        except Exception:
-            raise ErrorAPI("No se pudo conectar con el servidor", 0)
+                pass
+            self._conn = None
+
+    def _conectar(self):
+        esquema, host, puerto, _ = self._dest
+        if not host or not puerto:
+            raise OSError("direccion del servidor invalida")
+        clase = http.client.HTTPSConnection if esquema == "https" else http.client.HTTPConnection
+        self._conn = clase(host, puerto, timeout=10)
+        self._conn.connect()
+        try:
+            self._conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+    def llamar(self, metodo, ruta, datos=None, token=None):
+        cuerpo = json.dumps(datos).encode() if datos is not None else None
+        cab = {"Content-Type": "application/json", "User-Agent": f"AutoClickerAL/{APP_VERSION}"}
+        token = token or self.token
+        if token:
+            cab["Authorization"] = f"Bearer {token}"
+        with self._lock:
+            for intento in (1, 2):
+                reutilizada = self._conn is not None and time.monotonic() - self._uso < self.INACTIVA
+                try:
+                    if not reutilizada:
+                        self._cerrar()
+                        self._conectar()
+                    self._conn.request(metodo, self._dest[3] + ruta, body=cuerpo, headers=cab)
+                    resp = self._conn.getresponse()
+                    crudo = resp.read()
+                    self._uso = time.monotonic()
+                    if resp.will_close:
+                        self._cerrar()
+                    break
+                except self._CAIDAS:
+                    self._cerrar()
+                    if reutilizada and intento == 1:
+                        continue   # la conexion guardada ya estaba cerrada: se reintenta con una nueva
+                    raise ErrorAPI("No se pudo conectar con el servidor", 0)
+                except Exception:
+                    self._cerrar()
+                    raise ErrorAPI("No se pudo conectar con el servidor", 0)
+        try:
+            obj = json.loads(crudo or b"{}")
+        except ValueError:
+            obj = {}
+        if resp.status >= 400:
+            raise ErrorAPI(obj.get("error") or f"Error del servidor ({resp.status})", resp.status)
+        return obj
 
 
 def prehash(usuario, pw):
@@ -370,21 +435,27 @@ class Motor:
         self._parar.set()
 
     def _loop(self, accion, intervalo, rep):
+        parar = self._parar
+        intervalo = max(0.001, intervalo)
         try:
             prox = time.perf_counter()
-            while not self._parar.is_set():
-                accion(self._parar)
+            while not parar.is_set():
+                accion(parar)
                 self.ultimo = time.monotonic()
                 self.contador += 1
                 if rep and self.contador >= rep:
                     self.completado = True
                     break
-                prox += max(0.001, intervalo)
+                prox += intervalo
                 resto = prox - time.perf_counter()
                 if resto < -0.25:
-                    prox = time.perf_counter()
+                    prox = time.perf_counter()   # la PC se atraso mucho: no "recuperar" de golpe
                 elif resto > 0:
-                    self._parar.wait(resto)
+                    # espera normal y, el ultimo 1.5 ms, ajuste fino para un ritmo exacto
+                    if resto > 0.002 and parar.wait(resto - 0.0015):
+                        break
+                    while not parar.is_set() and time.perf_counter() < prox:
+                        time.sleep(0)
                 self.ultimo = time.monotonic()
         except Exception as e:
             self.error = str(e)
@@ -437,7 +508,7 @@ class VigilanteAtajos(threading.Thread):
             return
         self._ultima_revision = ahora
         # 2) ventana congelada
-        if ahora - self.latido_ui > 4.0:
+        if ahora - self.latido_ui > 8.0:
             self.detener_todo("La ventana dejó de responder; se detuvo todo por seguridad")
             return
         # 3) accion trabada
@@ -499,8 +570,6 @@ def px(v):
 
 
 def F(tam, peso="normal"):
-    if peso == "semi":
-        return (FUENTE + " Semibold" if ES_WINDOWS else FUENTE, tam)
     return (FUENTE, tam, peso)
 
 
@@ -533,6 +602,25 @@ def lineal(t):
 
 def rebote(s0, t):
     return 1 - (1 - s0) * math.cos(3 * math.pi * t) * (1 - t) ** 2
+
+
+_FUENTES = {}
+
+
+def medir(texto, tam, peso="normal"):
+    """Ancho en pixeles de un texto (las fuentes se crean una sola vez)."""
+    f = _FUENTES.get((tam, peso))
+    if f is None:
+        f = _FUENTES[(tam, peso)] = tkfont.Font(family=FUENTE, size=tam, weight=peso)
+    return f.measure(texto)
+
+
+def minimizada(w):
+    """True si la ventana esta minimizada: las animaciones se pausan para no gastar CPU."""
+    try:
+        return w.winfo_toplevel().state() == "iconic"
+    except tk.TclError:
+        return False
 
 
 # ─────────────────── imagenes suavizadas (antialias) ────────────────────
@@ -939,9 +1027,13 @@ class Tarjeta(tk.Frame):
         self.fondo.place(x=0, y=0, relwidth=1, relheight=1)
         self.cuerpo = tk.Frame(self, bg=color)
         self.cuerpo.pack(fill="both", expand=True, padx=px(pad), pady=px(pad))
+        self._tam = None
         self.bind("<Configure>", self._redibujar)
 
     def _redibujar(self, e):
+        if (e.width, e.height) == self._tam:
+            return
+        self._tam = (e.width, e.height)
         f = self.fondo
         f.limpiar()
         w, h, r = e.width, e.height, px(14)
@@ -972,8 +1064,8 @@ class Toast:
                 self.c.destroy()
             except Exception:
                 pass
-        fnt = tkfont.Font(family=FUENTE, size=10)
-        W, H = fnt.measure(msg) + px(70), px(44)
+        msg = msg if len(msg) <= 110 else msg[:107] + "…"
+        W, H = min(medir(msg, 10) + px(70), max(px(300), self.root.winfo_width() - px(40))), px(44)
         c = Lienzo(self.root, W, H, bg=BG)
         c.img(0, 0, img_rr(W, H, px(12), fill=PANEL2, outline=col, ow=1))
         c.create_text(px(22), H / 2, text=ico, fill=col, font=F(12, "bold"))
@@ -1010,6 +1102,9 @@ class FondoAnimado(Lienzo):
 
     def _loop(self):
         try:
+            if minimizada(self):
+                self.after(400, self._loop)
+                return
             w, h = max(1, self.winfo_width()), max(1, self.winfo_height())
             if not self.items:
                 self.items = [self.img(0, 0, img_glow(o["r"], o["c"]), anchor="center") for o in self.orbes]
@@ -1035,12 +1130,17 @@ class Logo(Lienzo):
 
     def _loop(self):
         try:
-            self.f += 0.04
-            self.limpiar()
-            self.img(0, 0, img_logo(self.S, (math.sin(self.f) + 1) / 2))
-            self.create_text(self.S / 2, self.S / 2, text="AL", fill="#ffffff",
-                             font=(FUENTE, max(8, int(self.S / ESCALA * 0.3)), "bold"))
-            self.after(60, self._loop)
+            if not minimizada(self):
+                self.f += 0.05
+                foto = img_logo(self.S, (math.sin(self.f) + 1) / 2)
+                if not self.refs:
+                    self._fondo = self.img(0, 0, foto)
+                    self.create_text(self.S / 2, self.S / 2, text="AL", fill="#ffffff",
+                                     font=(FUENTE, max(8, int(self.S / ESCALA * 0.3)), "bold"))
+                elif foto is not self.refs[0]:
+                    self.refs[0] = foto
+                    self.itemconfigure(self._fondo, image=foto)
+            self.after(80, self._loop)
         except tk.TclError:
             pass
 
@@ -1100,9 +1200,10 @@ class BotonPower(Lienzo):
             self._jp = None
             return
         try:
-            self.fase = (self.fase + 0.02) % 1
-            self.dibujar()
-            self._jp = self.after(33, self._pulso)
+            if not minimizada(self):
+                self.fase = (self.fase + 0.025) % 1
+                self.dibujar()
+            self._jp = self.after(40, self._pulso)
         except tk.TclError:
             self._jp = None
 
@@ -1114,6 +1215,7 @@ class BotonPower(Lienzo):
             self._pulso()
 
     def cuenta_regresiva(self, n, al_terminar):
+        """Muestra n, n-1 ... 1 (un segundo cada uno) y luego llama a al_terminar."""
         self.cancelar_cuenta(False)
         self.estado, self.cuenta = "cuenta", n
 
@@ -1125,9 +1227,11 @@ class BotonPower(Lienzo):
                 al_terminar()
                 return
             self._rebotar()
+            self._jc = self.after(1000, siguiente)
+
+        def siguiente():
             self.cuenta -= 1
-            self._jc = self.after(1000, paso)
-        self.cuenta += 1
+            paso()
         paso()
 
     def cancelar_cuenta(self, redibujar=True):
@@ -1178,8 +1282,9 @@ class Candado(Lienzo):
 
     def _loop(self):
         try:
-            self.f += 0.07
-            self.dibujar()
+            if not minimizada(self):
+                self.f += 0.07
+                self.dibujar()
             self.after(45, self._loop)
         except tk.TclError:
             pass
@@ -1205,8 +1310,7 @@ class Insignia(Lienzo):
 
     def __init__(self, master, rol, bg=None):
         txt, col = {"owner": ("OWNER", ORO), "admin": ("ADMIN", ACENTO2)}.get(rol, ("USUARIO", SUB))
-        fnt = tkfont.Font(family=FUENTE, size=7, weight="bold")
-        W, H = fnt.measure(txt) + px(16), px(20)
+        W, H = medir(txt, 7, "bold") + px(16), px(20)
         super().__init__(master, W, H, bg=bg)
         self.img(0, 0, img_rr(W, H, px(6), fill=mezclar(master.cget("bg"), col, 0.18), outline=col))
         self.create_text(W / 2, H / 2, text=txt, fill=col, font=F(7, "bold"))
@@ -1332,7 +1436,10 @@ def registrar_error(texto):
     try:
         base = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "AutoClickerAL")
         os.makedirs(base, exist_ok=True)
-        with open(os.path.join(base, "errores.log"), "a", encoding="utf-8") as f:
+        ruta = os.path.join(base, "errores.log")
+        if os.path.exists(ruta) and os.path.getsize(ruta) > 512 * 1024:
+            os.replace(ruta, ruta + ".viejo")
+        with open(ruta, "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] v{APP_VERSION}\n{texto}\n")
     except Exception:
         pass
@@ -1349,6 +1456,15 @@ def seguro(fn):
                 import traceback
                 registrar_error(traceback.format_exc())
     return w
+
+
+def puede_editar(yo, u):
+    """Mismas reglas que el servidor: el owner es intocable y los admins solo los toca el owner."""
+    if u["rol"] == "owner":
+        return False
+    if u["rol"] == "admin":
+        return yo["rol"] == "owner" or yo["id"] == u["id"]
+    return yo["rol"] in ("owner", "admin")
 
 
 class SelectorDuracion(tk.Frame):
@@ -1424,7 +1540,7 @@ class PantallaAuth(tk.Frame):
         t = tk.Frame(cab, bg=PANEL)
         t.pack(side="left", padx=px(12))
         etiqueta(t, APP_NOMBRE, 18, TEXTO, "bold").pack(anchor="w")
-        etiqueta(t, "Autoclicker de mouse y teclado", 9).pack(anchor="w")
+        etiqueta(t, f"Autoclicker de mouse y teclado · v{APP_VERSION}", 9).pack(anchor="w")
 
         self.tabs = Segmentado(c, ["Iniciar sesión", "Crear cuenta"], 0, command=self._construir,
                                ancho=330, alto=38)
@@ -1434,13 +1550,23 @@ class PantallaAuth(tk.Frame):
         self.estado = etiqueta(c, "● Conectando con el servidor…", 8, SUB)
         self.estado.pack(pady=(px(14), 0))
         self._construir(0)
-        if app.config_lista:
+        self._reintento = None
+        if app.conexion_iniciada:
             self.verificar_servidor()
 
     def verificar_servidor(self):
-        self.estado.config(text="● Conectando con el servidor…", fg=SUB)
-        self.app.api("GET", "/api/ping", None, seguro(lambda r: self.estado.config(text="● Servidor en línea", fg=OK)),
-                     seguro(lambda e: self.estado.config(text="● Sin conexión con el servidor", fg=ERROR)))
+        if self._reintento:
+            self.after_cancel(self._reintento)
+            self._reintento = None
+        self.app.api("GET", "/api/ping", None, seguro(self._en_linea), seguro(self._sin_conexion))
+
+    def _en_linea(self, _r):
+        self.estado.config(text="● Servidor en línea", fg=OK)
+        self.app.intentar_auto_login()
+
+    def _sin_conexion(self, _e):
+        self.estado.config(text="● Sin conexión con el servidor · reintentando…", fg=ERROR)
+        self._reintento = self.after(5000, seguro(self.verificar_servidor))
 
     def _construir(self, modo):
         for w in self.form.winfo_children():
@@ -1587,7 +1713,6 @@ class Pagina(tk.Frame):
         self.app, self.principal = app, principal
         cab = tk.Frame(self, bg=BG)
         cab.pack(fill="x", pady=(0, px(14)))
-        self.cab = cab
         etiqueta(cab, self.titulo, 19, TEXTO, "bold").pack(anchor="w")
         etiqueta(cab, self.subtitulo, 10).pack(anchor="w")
         self.cuerpo = tk.Frame(self, bg=BG)
@@ -1674,13 +1799,20 @@ class PaginaClicker(Pagina):
         self.c_veces.pack(side="left", padx=(px(10), 0))
         self.c_veces.habilitar(self.s_rep.get() == 1)
 
+    def fila_juego(self, ayuda):
+        der = self.fila(self.card, "Modo juego", "Roblox y otros juegos")
+        self.t_juego = Interruptor(der, self.cfg.get("juego", True))
+        self.t_juego.pack(side="left")
+        etiqueta(der, ayuda, 8, justify="left").pack(side="left", padx=(px(10), 0))
+
     def tiempos(self):
         iv = leer_entero(self.c_int.get(), 1, 3_600_000, "Intervalo")
         rep = leer_entero(self.c_veces.get(), 1, 100_000_000, "Repeticiones") if self.s_rep.get() == 1 else 0
         return iv / 1000, rep
 
     def config_base(self):
-        return {"intervalo": self.c_int.get(), "rep": self.s_rep.get(), "veces": self.c_veces.get()}
+        return {"intervalo": self.c_int.get(), "rep": self.s_rep.get(), "veces": self.c_veces.get(),
+                "juego": self.t_juego.get()}
 
     def actualizar(self, m):
         real = m.contador
@@ -1723,11 +1855,7 @@ class PaginaMouse(PaginaClicker):
         self.b_punto.pack(side="left", padx=(px(8), 0))
         self._pos(self.s_pos.get())
         self.fila_repetir()
-        der = self.fila(self.card, "Modo juego", "Roblox y otros juegos")
-        self.t_juego = Interruptor(der, cfg.get("juego", True))
-        self.t_juego.pack(side="left")
-        etiqueta(der, "Clics que los juegos sí detectan.\nApágalo solo si quieres la máxima velocidad.",
-                 8, justify="left").pack(side="left", padx=(px(10), 0))
+        self.fila_juego("Clics que los juegos sí detectan.\nApágalo solo si quieres la máxima velocidad.")
 
     def _pos(self, i):
         self.b_punto.set_texto(f"⌖ {self.punto[0]}, {self.punto[1]}" if i == 1 else "—")
@@ -1760,8 +1888,7 @@ class PaginaMouse(PaginaClicker):
 
     def obtener_config(self):
         d = self.config_base()
-        d.update(boton=self.s_boton.get(), tipo=self.s_tipo.get(), pos=self.s_pos.get(), punto=list(self.punto),
-                 juego=self.t_juego.get())
+        d.update(boton=self.s_boton.get(), tipo=self.s_tipo.get(), pos=self.s_pos.get(), punto=list(self.punto))
         return d
 
 
@@ -1780,6 +1907,7 @@ class PaginaTeclado(PaginaClicker):
         self.b_cap.pack(side="left", padx=(px(10), 0))
         self.fila_intervalo()
         self.fila_repetir()
+        self.fila_juego("Mantiene la tecla 40 ms para que el juego la note.\nApágalo para la máxima velocidad.")
 
     def _capturar(self):
         if self.capturando:
@@ -1793,7 +1921,9 @@ class PaginaTeclado(PaginaClicker):
 
     def _tecla(self, e):
         vk = e.keycode if ES_WINDOWS else 0x45
-        if vk in self.app.vks_atajo():
+        if not vk:
+            self.app.toast.mostrar("Esa tecla no se puede usar", "aviso")
+        elif vk in self.app.vks_atajo():
             self.app.toast.mostrar(f"{nombre_vk(vk)} es un atajo. Elige otra.", "aviso")
         else:
             self.vk = vk
@@ -1809,8 +1939,8 @@ class PaginaTeclado(PaginaClicker):
 
     def preparar(self):
         iv, rep = self.tiempos()
-        vk = self.vk
-        return (lambda p: presionar_tecla(vk, 25, p)), iv, rep
+        vk, mantener = self.vk, (40 if self.t_juego.get() else 8)
+        return (lambda p: presionar_tecla(vk, mantener, p)), iv, rep
 
     def obtener_config(self):
         d = self.config_base()
@@ -1923,9 +2053,9 @@ class PaginaLicencias(Pagina):
         if not l["usada_por"]:
             borrar = tk.Label(fr, text="✕", bg=bg, fg=SUB, font=F(10, "bold"), cursor="hand2")
             borrar.pack(side="right", padx=(px(6), 0))
-            borrar.bind("<Button-1>", lambda e, c=l["clave"]: self._borrar(c))
+            borrar.bind("<Button-1>", lambda e, c=l["clave"], b=borrar: self._borrar(c, b))
             borrar.bind("<Enter>", lambda e: borrar.config(fg=ERROR))
-            borrar.bind("<Leave>", lambda e: borrar.config(fg=SUB))
+            borrar.bind("<Leave>", lambda e: borrar.cget("text") == "✕" and borrar.config(fg=SUB))
             copiar = tk.Label(fr, text="Copiar", bg=bg, fg=ACENTO2, font=F(9, "bold"), cursor="hand2")
             copiar.pack(side="right")
             copiar.bind("<Button-1>", lambda e, c=l["clave"]: self.app.copiar(c, "Licencia copiada"))
@@ -1958,7 +2088,12 @@ class PaginaLicencias(Pagina):
         self.app.api("POST", "/api/admin/generar", {"cantidad": n, "duracion": seg, "tipo": tipo,
                                                     "nota": self.c_nota.get().strip()}, seguro(ok), seguro(err))
 
-    def _borrar(self, clave):
+    def _borrar(self, clave, etiqueta_x):
+        """Primer clic: pide confirmar. Segundo clic (en 3 s): borra."""
+        if etiqueta_x.cget("text") == "✕":
+            etiqueta_x.config(text="¿Borrar?", fg=ERROR)
+            etiqueta_x.after(3000, seguro(lambda: etiqueta_x.config(text="✕", fg=SUB)))
+            return
         self.app.api("POST", "/api/admin/borrar_licencia", {"clave": clave},
                      seguro(lambda r: (self.app.toast.mostrar("Licencia borrada", "ok"), self.cargar())))
 
@@ -1975,7 +2110,8 @@ class PaginaUsuarios(Pagina):
         top.pack(fill="x", pady=(0, px(8)))
         self.buscar = Campo(top, ancho=260, alto=36)
         self.buscar.pack(side="left")
-        self.buscar.var.trace_add("write", lambda *a: self._pintar())
+        self._job_buscar = None
+        self.buscar.var.trace_add("write", lambda *a: self._programar_pintado())
         etiqueta(top, "Buscar", 9).pack(side="left", padx=px(8))
         Boton(top, "↻", self.cargar, ancho=34, alto=28, estilo="sec", fuente=F(10, "bold")).pack(side="right")
         fil = tk.Frame(c, bg=PANEL)
@@ -1998,6 +2134,12 @@ class PaginaUsuarios(Pagina):
     def al_mostrar(self):
         self.cargar()
 
+    def _programar_pintado(self):
+        """Espera a que dejes de escribir (180 ms) para no redibujar en cada letra."""
+        if self._job_buscar:
+            self.after_cancel(self._job_buscar)
+        self._job_buscar = self.after(180, seguro(self._pintar))
+
     def cargar(self):
         self.app.api("GET", "/api/admin/usuarios", None, seguro(self._recibir))
 
@@ -2008,7 +2150,10 @@ class PaginaUsuarios(Pagina):
             u = next((x for x in self.datos if x["id"] == self.sel), None)
             self._mostrar(u) if u else self._vacio()
 
+    MAX_FILAS = 120
+
     def _pintar(self):
+        self._job_buscar = None
         self.lista.limpiar()
         b = self.buscar.get().strip().lower()
         f = self.filtro.get()
@@ -2019,8 +2164,11 @@ class PaginaUsuarios(Pagina):
         self.lbl_cuenta.config(text=f"{len(self.datos)} cuentas · {con} con acceso")
         if not filas:
             etiqueta(self.lista.inner, "Sin resultados.", 9).pack(pady=px(20))
-        for u in filas[:300]:
+        for u in filas[:self.MAX_FILAS]:
             self._fila(u)
+        if len(filas) > self.MAX_FILAS:
+            etiqueta(self.lista.inner, f"Mostrando {self.MAX_FILAS} de {len(filas)} · usa el buscador",
+                     8).pack(pady=px(10))
 
     def _fila(self, u):
         sel = u["id"] == self.sel
@@ -2039,9 +2187,7 @@ class PaginaUsuarios(Pagina):
         else:
             est = fmt_restante(u["vence"])
             col = OK if u["acceso"] else SUB
-        editable = u["rol"] != "owner" and (u["rol"] != "admin" or self.app.yo["rol"] == "owner") \
-            and u["id"] != self.app.yo["id"]
-        if editable:
+        if puede_editar(self.app.yo, u) and u["id"] != self.app.yo["id"]:
             txt_b = "Desbanear" if u["baneado"] else "Banear"
             ban = tk.Label(fr, text=txt_b, bg=bg, fg=OK if u["baneado"] else ERROR, font=F(8, "bold"),
                            cursor="hand2", padx=px(6))
@@ -2093,8 +2239,7 @@ class PaginaUsuarios(Pagina):
             f.pack(fill="x", pady=(px(3), 0))
             etiqueta(f, k, 9).pack(side="left")
             etiqueta(f, v, 9, TEXTO, "bold").pack(side="right")
-        editable = u["rol"] != "owner" and (u["rol"] != "admin" or yo["rol"] == "owner" or u["id"] == yo["id"])
-        if not editable:
+        if not puede_editar(yo, u):
             etiqueta(d, "No tienes permiso para modificar\nesta cuenta.", 9, AVISO, justify="center").pack(pady=px(20))
             return
         etiqueta(d, "DAR TIEMPO", 8, ACENTO2, "bold").pack(anchor="w", pady=(px(14), px(4)))
@@ -2111,16 +2256,18 @@ class PaginaUsuarios(Pagina):
         Boton(d, "Agregar tiempo", dar, ancho=284, alto=38).pack(pady=(px(8), px(10)))
         g = tk.Frame(d, bg=PANEL)
         g.pack()
-        acciones = [("Quitar licencia", lambda: self._accion(u, "quitar_licencia", "Licencia quitada")),
-                    ("Desbanear" if u["baneado"] else "Banear",
-                     lambda: self._accion(u, "desbanear" if u["baneado"] else "banear",
-                                          "Usuario desbaneado" if u["baneado"] else "Usuario baneado"))]
+        acciones = [("Quitar licencia", lambda: self._accion(u, "quitar_licencia", "Licencia quitada"))]
+        if u["id"] != yo["id"]:
+            acciones.append(("Desbanear" if u["baneado"] else "Banear",
+                             lambda: self._accion(u, "desbanear" if u["baneado"] else "banear",
+                                                  "Usuario desbaneado" if u["baneado"] else "Usuario baneado")))
         if yo["rol"] == "owner":
             if u["admin_vence"] is not None:
                 acciones.append(("Quitar admin", lambda: self._accion(u, "quitar_admin", "Ya no es admin")))
             else:
                 acciones.append(("Hacer admin", lambda: self._accion(u, "hacer_admin", "Ahora es admin")))
-        acciones.append(("Eliminar cuenta", None))
+        if u["id"] != yo["id"]:
+            acciones.append(("Eliminar cuenta", None))
         for i, (txt, cb) in enumerate(acciones):
             b = Boton(g, txt, cb, ancho=140, alto=34, estilo="sec", fuente=F(9, "bold"))
             b.grid(row=i // 2, column=i % 2, padx=px(1), pady=px(1))
@@ -2181,7 +2328,22 @@ class PaginaCuenta(Pagina):
         self.c_lic = Campo(f, ancho=250, alto=38, fuente=(MONO, 11, "bold"), justify="center")
         self.c_lic.pack(side="left")
         formatear_clave(self.c_lic)
+        self.c_lic.al_enter(self._canjear)
         Boton(f, "Canjear", self._canjear, ancho=96, alto=38).pack(side="left", padx=(px(6), 0))
+
+        etiqueta(c, "CAMBIAR CONTRASEÑA", 8, ACENTO2, "bold").pack(anchor="w", pady=(px(18), px(4)))
+        self.c_pw_act = Campo(c, ancho=250, alto=38, show="•", ojo=True)
+        self.c_pw_act.pack(anchor="w")
+        etiqueta(c, "Actual", 8).pack(anchor="w")
+        f = tk.Frame(c, bg=PANEL)
+        f.pack(fill="x", pady=(px(4), 0))
+        self.c_pw_nueva = Campo(f, ancho=250, alto=38, show="•", ojo=True)
+        self.c_pw_nueva.pack(side="left")
+        self.b_pw = Boton(f, "Cambiar", self._cambiar_pw, ancho=96, alto=38, estilo="sec")
+        self.b_pw.pack(side="left", padx=(px(6), 0))
+        etiqueta(c, "Nueva (mínimo 6 caracteres)", 8).pack(anchor="w")
+        self.c_pw_act.al_enter(lambda: self.c_pw_nueva.e.focus_set())
+        self.c_pw_nueva.al_enter(self._cambiar_pw)
 
         der = Tarjeta(self.cuerpo, pad=20)
         der.pack(side="left", fill="both", padx=(px(14), 0))
@@ -2233,13 +2395,38 @@ class PaginaCuenta(Pagina):
         self._pintar_lic()
 
     def _canjear(self):
+        if len(re.sub(r"[^A-Z0-9]", "", self.c_lic.get())) != 18:
+            return self.app.toast.mostrar("La licencia está incompleta", "error")
+
         def ok(r):
-            self.app.yo = r["yo"]
             self.c_lic.set("")
-            self._pintar_lic()
-            self.principal.refrescar_usuario()
-            self.app.toast.mostrar(f"Se agregó {fmt_duracion(r['duracion'])}", "ok")
+            if r["tipo"] == "admin":
+                self.app.toast.mostrar("Ahora eres administrador", "ok")
+            else:
+                self.app.toast.mostrar(f"Se agregó {fmt_duracion(r['duracion'])}", "ok")
+            self.app.aplicar_yo(r["yo"])
         self.app.api("POST", "/api/canjear", {"clave": self.c_lic.get()}, seguro(ok))
+
+    def _cambiar_pw(self):
+        if not self.b_pw.habilitado:
+            return
+        actual, nueva = self.c_pw_act.get(), self.c_pw_nueva.get()
+        if not actual:
+            return self.app.toast.mostrar("Escribe tu contraseña actual", "error")
+        if len(nueva) < 6:
+            return self.app.toast.mostrar("La nueva debe tener al menos 6 caracteres", "error")
+        nombre = self.app.yo["nombre"]
+        self.b_pw.set_habilitado(False)
+
+        def listo(r=None, error=None):
+            self.b_pw.set_habilitado(True)
+            if error:
+                return self.app.toast.mostrar(error.msg, "error")
+            self.c_pw_act.set("")
+            self.c_pw_nueva.set("")
+            self.app.toast.mostrar("Contraseña cambiada. Se cerró la sesión en tus otras PCs.", "ok", 4000)
+        self.app.api("POST", "/api/cambiar_pw", {"actual": prehash(nombre, actual), "nueva": prehash(nombre, nueva)},
+                     seguro(lambda r: listo(r)), seguro(lambda e: listo(error=e)))
 
     def _set(self, k, v):
         self.app.ajustes()[k] = v
@@ -2453,8 +2640,11 @@ class App(tk.Tk):
         self.anim = Anim(self)
         self.yo = None
         self.pantalla = None
-        self.config_lista = False
-        self.remota = self.local.datos.get("remota") or {}
+        self.capa_update = None
+        self.conexion_iniciada = False
+        self._auto_login = False      # hay un auto-login en curso
+        self._ultimo_refresco = 0.0
+        self.remota = self.local.datos.get("remota") or {}   # ultima config de GitHub guardada
         self.cliente.usar(url_servidor(self.remota))
         self.motores = {"mouse": Motor(), "teclado": Motor()}
         self.cola_atajos = queue.Queue()
@@ -2469,34 +2659,67 @@ class App(tk.Tk):
             self.anim.run("alpha", 450, lambda t: self.attributes("-alpha", t))
         except tk.TclError:
             pass
-        threading.Thread(target=lambda: self.cola_ui.put((self._config_lista, leer_config_remota(), False, None)),
+        # La config de GitHub se pide en segundo plano. Si ya hay una guardada, se conecta
+        # de inmediato con ella (arranque instantaneo) y luego se actualiza si cambio.
+        threading.Thread(target=lambda: self.cola_ui.put((self._config_nueva, leer_config_remota(), False, None)),
                          daemon=True).start()
+        if self.remota:
+            self.after(1, self._iniciar_conexion)
         self._tick()
-        self.after(300_000, self._latido)
+        self.after(60_000, self._latido)
 
     # --- configuracion desde GitHub ---
-    def _config_lista(self, remota):
-        self.config_lista = True
+    def _update_obligatoria(self):
+        return bool(self.remota.get("obligatoria")) and \
+            version_tupla(self.remota.get("version", "0")) > version_tupla(APP_VERSION)
+
+    def _iniciar_conexion(self):
+        if self.conexion_iniciada:
+            return
+        self.conexion_iniciada = True
+        if isinstance(self.pantalla, PantallaAuth):
+            self.pantalla.verificar_servidor()   # al responder, intenta el auto-login
+
+    def intentar_auto_login(self):
+        tok = self.local.datos.get("token")
+        if (not tok or not self.local.datos.get("recordar", True) or self._auto_login
+                or not isinstance(self.pantalla, PantallaAuth) or self._update_obligatoria()):
+            return
+        self._auto_login = True
+        self.cliente.token = tok
+
+        def fin_ok(r):
+            self._auto_login = False
+            self.entrar(tok, r["yo"], True)
+
+        def fin_error(e):
+            self._auto_login = False
+            if e.codigo in (401, 403):        # sesion vencida o cuenta suspendida
+                self.local.datos["token"] = None
+                self.local.guardar()
+        self.api("GET", "/api/yo", None, fin_ok, fin_error)
+
+    def _config_nueva(self, remota):
         if remota:
+            cambio = url_servidor(remota) != self.cliente.url
             self.remota = remota
             self.local.datos["remota"] = remota
             self.local.guardar()
             self.cliente.usar(url_servidor(remota))
-        if isinstance(self.pantalla, PantallaAuth):
-            self.pantalla.verificar_servidor()
-        tok = self.local.datos.get("token")
-        if tok and self.local.datos.get("recordar", True):
-            self.cliente.token = tok
-            self.api("GET", "/api/yo", None, lambda r: self.entrar(tok, r["yo"], True), lambda e: None)
+            if cambio and self.conexion_iniciada and isinstance(self.pantalla, PantallaAuth):
+                self.pantalla.verificar_servidor()
+        self._iniciar_conexion()
         if self.remota.get("anuncio"):
             self.after(1500, lambda: self.toast.mostrar(str(self.remota["anuncio"])[:120], "info", 6000))
         if version_tupla(self.remota.get("version", "0")) > version_tupla(APP_VERSION):
             self.after(900, self._ofrecer_actualizacion)
 
     def _ofrecer_actualizacion(self):
+        if self.capa_update is not None:
+            return
         r = self.remota
         obligatoria = bool(r.get("obligatoria"))
-        capa = tk.Frame(self, bg=BG)
+        capa = self.capa_update = tk.Frame(self, bg=BG)
         capa.place(x=0, y=0, relwidth=1, relheight=1)
         t = Tarjeta(capa, pad=28)
         t.place(relx=0.5, rely=0.5, anchor="center")
@@ -2512,7 +2735,10 @@ class App(tk.Tk):
         b.command = lambda: self._actualizar(b)
         b.pack(pady=(px(4), px(6)))
         if not obligatoria:
-            enlace(c, "Más tarde", capa.destroy).pack()
+            def despues():
+                capa.destroy()
+                self.capa_update = None
+            enlace(c, "Más tarde", despues).pack()
         self.toast.arriba()
 
     def _actualizar(self, boton):
@@ -2534,17 +2760,26 @@ class App(tk.Tk):
                     total = int(r.headers.get("Content-Length") or 0)
                     hecho = 0
                     while True:
-                        bloque = r.read(65536)
+                        bloque = r.read(256 * 1024)
                         if not bloque:
                             break
                         f.write(bloque)
                         hecho += len(bloque)
                         prog["p"] = hecho / total if total else 0
-                if os.path.getsize(destino) < 1_000_000:
-                    raise RuntimeError("archivo incompleto")
+                with open(destino, "rb") as f:
+                    es_exe = f.read(2) == b"MZ"
+                tam = os.path.getsize(destino)
+                if not es_exe or tam < 1_000_000 or (total and tam != total):
+                    raise RuntimeError("el archivo llegó incompleto")
                 prog["fin"] = "ok"
+            except PermissionError:
+                prog["fin"] = "No tengo permiso de escribir en la carpeta del programa. Descárgalo desde GitHub."
             except Exception as e:
                 prog["fin"] = f"No se pudo descargar ({e})"
+                try:
+                    os.remove(destino)
+                except OSError:
+                    pass
 
         def vigilar():
             if prog["fin"] is None:
@@ -2608,10 +2843,10 @@ del "%~f0"
             w = getattr(w, "master", None)
 
     # --- red (en segundo plano, sin congelar la ventana) ---
-    def api(self, metodo, ruta, datos=None, ok=None, err=None):
+    def api(self, metodo, ruta, datos=None, ok=None, err=None, token=None):
         def trabajo():
             try:
-                self.cola_ui.put((ok, self.cliente.llamar(metodo, ruta, datos), False, err))
+                self.cola_ui.put((ok, self.cliente.llamar(metodo, ruta, datos, token), False, err))
             except ErrorAPI as e:
                 self.cola_ui.put((ok, e, True, err))
         threading.Thread(target=trabajo, daemon=True).start()
@@ -2642,22 +2877,41 @@ del "%~f0"
             self.toast.mostrar(f"Hola, {yo['nombre']}", "ok")
         self.mostrar(PantallaPrincipal if yo["acceso"] else PantallaLicencia)
 
+    def aplicar_yo(self, nuevo):
+        """Actualiza los datos de la cuenta y adapta la pantalla si cambio el acceso o el rol."""
+        viejo, self.yo = self.yo, nuevo
+        p = self.pantalla
+        if not isinstance(p, PantallaPrincipal):
+            return
+        if not nuevo["acceso"]:
+            p.detener_todo(False)
+            self.vigilante.habilitado = False
+            self.mostrar(PantallaLicencia, aviso="Tu licencia venció. Activa una nueva para seguir.")
+        elif viejo and viejo["rol"] != nuevo["rol"]:
+            p.detener_todo(False)
+            self.guardar_config()
+            self.mostrar(PantallaPrincipal)   # se reconstruye el panel con las secciones del nuevo rol
+        else:
+            p.refrescar_usuario()
+
     def refrescar_yo(self):
-        def ok(r):
-            self.yo = r["yo"]
-            if isinstance(self.pantalla, PantallaPrincipal):
-                if not self.yo["acceso"]:
-                    self.pantalla.detener_todo(False)
-                    self.vigilante.habilitado = False
-                    self.mostrar(PantallaLicencia, aviso="Tu licencia venció. Activa una nueva para seguir.")
-                else:
-                    self.pantalla.refrescar_usuario()
-        if self.yo:
-            self.api("GET", "/api/yo", None, seguro(ok), lambda e: None)
+        if not self.yo:
+            return
+        self._ultimo_refresco = time.monotonic()
+        self.api("GET", "/api/yo", None, seguro(lambda r: self.aplicar_yo(r["yo"])), lambda e: None)
 
     def _latido(self):
-        self.refrescar_yo()
-        self.after(300_000, self._latido)
+        # cada minuto: detecta baneos, licencias quitadas o cambios de rol
+        if isinstance(self.pantalla, PantallaPrincipal):
+            self.refrescar_yo()
+        self.after(60_000, self._latido)
+
+    def _revisar_vencimiento(self):
+        """Si la licencia vence mientras el programa esta abierto, se revisa al momento."""
+        yo = self.yo
+        if (yo and yo["rol"] == "user" and yo.get("vence") and yo["vence"] > 0 and yo["vence"] < time.time()
+                and time.monotonic() - self._ultimo_refresco > 10):
+            self.refrescar_yo()
 
     def cerrar_sesion(self, avisar=True):
         self.guardar_config()
@@ -2670,7 +2924,8 @@ del "%~f0"
         except tk.TclError:
             pass
         if avisar and self.cliente.token:
-            self.api("POST", "/api/salir", {}, None, lambda e: None)
+            self.api("POST", "/api/salir", {}, None, lambda e: None, token=self.cliente.token)
+        self.cliente.token = None
         self.local.datos["token"] = None
         self.local.guardar()
         self.yo = None
@@ -2691,6 +2946,8 @@ del "%~f0"
                 nueva.place_configure(x=int(W * direccion * (1 - t)))
                 vieja.place_configure(x=int(-W * direccion * t))
             self.anim.run("pantalla", 460, fn, ease=ease_in_out, done=vieja.destroy)
+        if self.capa_update is not None:
+            tk.Misc.tkraise(self.capa_update)
         self.toast.arriba()
 
     def copiar(self, texto, msg):
@@ -2729,6 +2986,8 @@ del "%~f0"
                     self._resolver(ok, val, es_err, err)
                 except tk.TclError:
                     pass
+                except Exception:
+                    self.report_callback_exception(*sys.exc_info())   # se registra y se sigue
             p = self.pantalla
             if isinstance(p, PantallaPrincipal):
                 if not self.vigilante.atajos:
@@ -2744,6 +3003,7 @@ del "%~f0"
                     else:
                         p.alternar(ev)
                 p.actualizar()
+                self._revisar_vencimiento()
             else:
                 while not self.cola_atajos.empty():
                     self.cola_atajos.get_nowait()
@@ -2757,10 +3017,30 @@ del "%~f0"
         self.destroy()
 
 
+def unica_instancia():
+    """Evita abrir el programa dos veces (los atajos se pelearian). Si ya esta abierto, lo trae al frente."""
+    if not ES_WINDOWS:
+        return True
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    globals()["_MUTEX"] = k32.CreateMutexW(None, False, "Local\\AutoClickerAL_unico")
+    if ctypes.get_last_error() != 183:          # ERROR_ALREADY_EXISTS
+        return True
+    user32.FindWindowW.restype = wintypes.HWND
+    user32.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
+    hwnd = user32.FindWindowW(None, APP_NOMBRE)
+    if hwnd:
+        user32.ShowWindow(hwnd, 9)               # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+    return False
+
+
 if __name__ == "__main__":
     if Image is None:
         import tkinter.messagebox as mb
         tk.Tk().withdraw()
         mb.showerror(APP_NOMBRE, "Falta la librería Pillow.\nAbre CMD y ejecuta:  pip install pillow")
         sys.exit(1)
-    App().mainloop()
+    if unica_instancia():
+        App().mainloop()
