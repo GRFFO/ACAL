@@ -1212,7 +1212,9 @@ class Campo(Lienzo):
 
 class Tarjeta(tk.Frame):
 
-    def __init__(self, master, pad=20, color=PANEL, borde=BORDE):
+    def __init__(self, master, pad=20, color=None, borde=None):
+        color = PANEL if color is None else color
+        borde = BORDE if borde is None else borde
         super().__init__(master, bg=master.cget("bg"))
         self.color, self.borde = color, borde
         self.fondo = Lienzo(self, 10, 10, bg=master.cget("bg"))
@@ -1612,7 +1614,8 @@ class Navegacion(Lienzo):
 
 class ListaScroll(tk.Frame):
 
-    def __init__(self, master, bg=PANEL):
+    def __init__(self, master, bg=None):
+        bg = PANEL if bg is None else bg
         super().__init__(master, bg=bg)
         self.c = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
         self.c.pack(fill="both", expand=True)
@@ -1631,11 +1634,13 @@ class ListaScroll(tk.Frame):
         self.c.yview_moveto(0)
 
 
-def etiqueta(master, texto, tam=10, color=SUB, peso="normal", **kw):
+def etiqueta(master, texto, tam=10, color=None, peso="normal", **kw):
+    color = SUB if color is None else color
     return tk.Label(master, text=tr(texto), bg=master.cget("bg"), fg=color, font=F(tam, peso), **kw)
 
 
-def enlace(master, texto, cb, color=SUB):
+def enlace(master, texto, cb, color=None):
+    color = SUB if color is None else color
     l = etiqueta(master, texto, 9, color, cursor="hand2")
     l.bind("<Button-1>", lambda e: cb())
     l.bind("<Enter>", lambda e: l.config(fg=TEXTO))
