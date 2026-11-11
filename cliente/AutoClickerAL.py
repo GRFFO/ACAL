@@ -1426,7 +1426,7 @@ class BotonPower(Lienzo):
         else:
             self.img(c, c - R * 0.12, img_power(int(R * 0.62)), "center")
             txt = "DETENER" if self.estado == "on" else "INICIAR"
-        self.create_text(c, c + R * 0.5, text=txt, fill=mezclar(SUB, "#ffffff", 0.6 + 0.4 * self.ht),
+        self.create_text(c, c + R * 0.5, text=tr(txt), fill=mezclar(SUB, "#ffffff", 0.6 + 0.4 * self.ht),
                          font=F(9, "bold"))
 
     def _pulso(self):
