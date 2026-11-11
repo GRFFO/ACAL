@@ -19,6 +19,7 @@ import re
 import secrets
 import signal
 import sqlite3
+import sys
 import threading
 import time
 import traceback
@@ -630,12 +631,22 @@ def mantenimiento():
         time.sleep(3600)
 
 
+class Servidor(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # un cliente que cierra la conexion (PC apagada, sin internet) no es un error del servidor
+        tipo = sys.exc_info()[0]
+        if tipo and issubclass(tipo, (ConnectionError, TimeoutError)):
+            return
+        log("ERROR de conexión\n" + traceback.format_exc())
+
+
 def main():
     puerto = int(leer_env().get("PORT") or os.getenv("PORT") or os.getenv("SERVER_PORT") or 8080)
     roles_env()
     threading.Thread(target=mantenimiento, daemon=True).start()
-    servidor = ThreadingHTTPServer(("0.0.0.0", puerto), Manejador)
-    servidor.daemon_threads = True
+    servidor = Servidor(("0.0.0.0", puerto), Manejador)
 
     def apagar(*_):
         threading.Thread(target=servidor.shutdown, daemon=True).start()

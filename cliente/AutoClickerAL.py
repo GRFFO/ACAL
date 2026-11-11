@@ -692,11 +692,14 @@ def img_ojo(w, h, color, tachado):
 
 def img_glow(r, color):
     def crear():
-        S, k = int(r * 2.8), 4
-        s, rr = S // k, r / k
+        # se dibuja pequeño (rapido) con margen de 3 sigmas para que el difuminado llegue a 0
+        k = 4
+        rr = r / k
+        sigma = rr * 0.6
+        s = int(2 * (rr + 3 * sigma)) + 2
         im = Image.new("RGBA", (s, s), _rgb(color) + (0,))
-        ImageDraw.Draw(im).ellipse((s / 2 - rr, s / 2 - rr, s / 2 + rr, s / 2 + rr), fill=_rgb(color) + (60,))
-        return im.filter(ImageFilter.GaussianBlur(rr * 0.45)).resize((S, S), Image.BICUBIC)
+        ImageDraw.Draw(im).ellipse((s / 2 - rr, s / 2 - rr, s / 2 + rr, s / 2 + rr), fill=_rgb(color) + (70,))
+        return im.filter(ImageFilter.GaussianBlur(sigma)).resize((s * k, s * k), Image.BICUBIC)
     return _foto(("glow", int(r), color), crear)
 
 
@@ -1858,7 +1861,7 @@ class PaginaMouse(PaginaClicker):
         self.fila_juego("Clics que los juegos sí detectan.\nApágalo solo si quieres la máxima velocidad.")
 
     def _pos(self, i):
-        self.b_punto.set_texto(f"⌖ {self.punto[0]}, {self.punto[1]}" if i == 1 else "—")
+        self.b_punto.set_texto(f"⌖ {self.punto[0]}, {self.punto[1]}" if i == 1 else "Elegir punto")
         self.b_punto.set_habilitado(i == 1)
 
     def _elegir(self):
@@ -2161,7 +2164,8 @@ class PaginaUsuarios(Pagina):
                    lambda u: u["rol"] != "user", lambda u: u["baneado"]]
         filas = [u for u in self.datos if pruebas[f](u) and (not b or b in u["nombre"].lower() or b in str(u["id"]))]
         con = sum(1 for u in self.datos if u["acceso"] and not u["baneado"])
-        self.lbl_cuenta.config(text=f"{len(self.datos)} cuentas · {con} con acceso")
+        n = len(self.datos)
+        self.lbl_cuenta.config(text=f"{n} cuenta{'' if n == 1 else 's'} · {con} con acceso")
         if not filas:
             etiqueta(self.lista.inner, "Sin resultados.", 9).pack(pady=px(20))
         for u in filas[:self.MAX_FILAS]:
@@ -2621,6 +2625,8 @@ AJUSTES_DEF = {"hk_mouse": 0x75, "hk_teclado": 0x76, "hk_stop": 0x77, "retraso":
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        _CACHE.clear()
+        _FUENTES.clear()
         global ESCALA
         try:
             ESCALA = max(1.0, min(3.0, self.winfo_fpixels("1i") / 96.0)) if ES_WINDOWS else 1.0
