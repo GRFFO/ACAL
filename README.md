@@ -81,5 +81,21 @@ Haz los cambios en `servidor/` y reinicia el servidor desde el panel. Con *Auto 
 - **Licencias**: crear licencias y ver la lista de libres y usadas, con el nombre de quién usó cada una.
 - **Usuarios**: todas las cuentas registradas, con su usuario, ID, rol y tiempo restante. Puedes filtrar por *Con licencia*, *Admins* o *Baneados*. Tiene un botón para banear directo en cada fila y opciones para dar tiempo, quitar la licencia, hacer admin o eliminar.
 
-## Respaldo
-Las cuentas y licencias están en `servidor/datos.db`, en el hosting. Ese archivo no se sube a GitHub. Descárgalo de vez en cuando como copia de seguridad.
+## Respaldos
+Las cuentas y licencias están en `servidor/datos.db` del hosting (no se sube a GitHub).
+El servidor guarda **una copia automática al día** en `servidor/respaldos/` (las 7 más recientes).
+Para restaurar: detén el servidor, copia el respaldo elegido sobre `datos.db` y vuelve a encenderlo.
+
+## Seguridad
+- Las contraseñas nunca viajan tal cual: el programa envía un hash y el servidor lo vuelve a cifrar (PBKDF2).
+- Las sesiones se guardan cifradas en el servidor y caducan solas tras 30 días sin uso.
+- 12 intentos fallidos (contraseña o licencia) bloquean esa red 10 minutos; máximo 6 cuentas nuevas por hora por red.
+- Cada usuario puede **cambiar su contraseña** en *Cuenta*; al hacerlo se cierra su sesión en las demás PCs.
+
+## Pruebas automáticas
+Cada cambio en el código se prueba solo en GitHub (pestaña **Actions → Pruebas**):
+- **Servidor**: registro, licencias, roles, baneos, límites, conexiones simultáneas y migración de datos.
+- **Programa en Windows real**: recorre todas las pantallas, mide clics reales, la precisión del ritmo y
+  cada protección, y toma capturas de pantalla.
+
+Al publicar una Release, el `.exe` **solo se compila si las pruebas pasan**.
