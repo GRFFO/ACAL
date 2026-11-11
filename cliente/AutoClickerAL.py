@@ -1,16 +1,8 @@
 # -*- coding: utf-8 -*-
-"""
-AutoClicker AL - autoclicker de mouse y teclado con cuentas y licencias en linea.
-
-Requisitos: Windows 10/11, Python 3.9+ y Pillow  (pip install pillow)
-Ejecutar:   python AutoClickerAL.py
-
-La direccion del servidor se toma de config.json en GitHub (GITHUB_REPO). Un archivo
-"servidor.txt" junto al programa/.exe tiene prioridad (util para pruebas).
-"""
 
 import hashlib
 import http.client
+import io
 import json
 import math
 import os
@@ -27,18 +19,15 @@ from collections import OrderedDict
 from datetime import datetime
 from urllib.parse import urlsplit
 
-# ════════════════════════════ CONFIGURACION ════════════════════════════
-# Repositorio de GitHub (publico) donde esta config.json. Desde ahi se controla
-# la direccion del servidor, la version y los anuncios, sin recompilar el .exe.
-GITHUB_REPO = "GRFFO/ACAL"   # <- cambia esto: usuario/repositorio
+
+GITHUB_REPO = "GRFFO/ACAL"
 GITHUB_RAMA = "main"
-SERVIDOR = "http://fi18.bot-hosting.cloud:26369"   # respaldo si GitHub no responde
+SERVIDOR = "http://fi18.bot-hosting.cloud:26369"
 APP_NOMBRE = "AutoClicker AL"
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 ES_WINDOWS = platform.system() == "Windows"
 
-# Los hilos se turnan cada 1 ms (por defecto 5 ms): el clicker no se retrasa
-# aunque la ventana este dibujando animaciones al mismo tiempo.
+
 sys.setswitchinterval(0.001)
 
 
@@ -49,7 +38,6 @@ def carpeta_app():
 
 
 def leer_config_remota():
-    """Lee config.json del repositorio de GitHub (o None si no se puede)."""
     if "TU-USUARIO" in GITHUB_REPO:
         return None
     url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_RAMA}/config.json"
@@ -83,8 +71,6 @@ def url_servidor(remota=None):
     return url
 
 
-# ═════════════════════════ CONEXION AL SERVIDOR ══════════════════════════
-
 class ErrorAPI(Exception):
     def __init__(self, msg, codigo=0):
         super().__init__(msg)
@@ -92,9 +78,8 @@ class ErrorAPI(Exception):
 
 
 class ClienteAPI:
-    """Habla con el servidor reutilizando la misma conexion (evita abrir una por peticion)."""
 
-    INACTIVA = 12          # s sin uso antes de abrir otra (el servidor cierra a los 20)
+    INACTIVA = 12
     _CAIDAS = (http.client.RemoteDisconnected, http.client.CannotSendRequest,
                ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
 
@@ -111,7 +96,7 @@ class ClienteAPI:
         try:
             p = urlsplit(url)
             dest = (p.scheme, p.hostname or "", p.port or (443 if p.scheme == "https" else 80), p.path.rstrip("/"))
-        except ValueError:      # direccion mal escrita: cada llamada dara "sin conexion"
+        except ValueError:
             dest = ("http", "", 0, "")
         with self._lock:
             if dest != self._dest:
@@ -162,7 +147,7 @@ class ClienteAPI:
                 except self._CAIDAS:
                     self._cerrar()
                     if reutilizada and intento == 1:
-                        continue   # la conexion guardada ya estaba cerrada: se reintenta con una nueva
+                        continue
                     raise ErrorAPI("No se pudo conectar con el servidor", 0)
                 except Exception:
                     self._cerrar()
@@ -172,17 +157,16 @@ class ClienteAPI:
         except ValueError:
             obj = {}
         if resp.status >= 400:
-            raise ErrorAPI(obj.get("error") or f"Error del servidor ({resp.status})", resp.status)
+            raise ErrorAPI(obj.get("error") or tr("Error del servidor ({c})", c=resp.status), resp.status)
         return obj
 
 
 def prehash(usuario, pw):
-    # la contraseña nunca viaja tal cual por la red
+
     return hashlib.sha256(f"AL|{usuario.strip().lower()}|{pw}".encode()).hexdigest()
 
 
 class Local:
-    """Datos de esta PC: sesion recordada y configuracion de cada usuario."""
 
     def __init__(self):
         base = os.getenv("APPDATA") or os.path.expanduser("~")
@@ -209,11 +193,84 @@ class Local:
         return self.datos["config"].setdefault(str(uid), {})
 
 
-# ═════════════════════════ DURACIONES / FORMATOS ═════════════════════════
+LOGO = {"pil": None, "version": 0}
+SONIDO = {"on": True}
+
+
+def reproducir(tipo):
+    if not ES_WINDOWS or not SONIDO["on"]:
+        return
+
+    def tocar():
+        try:
+            import winsound
+            for frec, ms in ((900, 55), (1250, 70)) if tipo == "on" else ((700, 60), (460, 85)):
+                winsound.Beep(frec, ms)
+        except Exception:
+            pass
+    threading.Thread(target=tocar, daemon=True).start()
+
+
+def _url_logo(valor):
+    valor = str(valor or "").strip()
+    if not valor:
+        return ""
+    if valor.startswith(("http://", "https://")):
+        return valor
+    return f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_RAMA}/{valor.lstrip('/')}"
+
+
+def cargar_logo_cache(local):
+    ruta = os.path.join(local.dir, "logo.png")
+    if os.path.exists(ruta):
+        try:
+            LOGO["pil"] = Image.open(ruta).convert("RGBA")
+            LOGO["version"] += 1
+        except Exception:
+            LOGO["pil"] = None
+
+
+def sincronizar_logo(remota, local, al_cambiar):
+    ruta = os.path.join(local.dir, "logo.png")
+    url = _url_logo((remota or {}).get("logo"))
+    if not url:
+        if local.datos.get("logo_url"):
+            local.datos["logo_url"] = ""
+            local.guardar()
+            try:
+                os.remove(ruta)
+            except OSError:
+                pass
+            LOGO["pil"], LOGO["version"] = None, LOGO["version"] + 1
+            al_cambiar()
+        return
+    if url == local.datos.get("logo_url") and LOGO["pil"] is not None:
+        return
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "AutoClickerAL", "Cache-Control": "no-cache"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            crudo = r.read(8 * 1024 * 1024)
+        im = Image.open(io.BytesIO(crudo)).convert("RGBA")
+        im.thumbnail((256, 256), Image.LANCZOS)
+        im.save(ruta, "PNG")
+        LOGO["pil"], LOGO["version"] = im, LOGO["version"] + 1
+        local.datos["logo_url"] = url
+        local.guardar()
+        al_cambiar()
+    except Exception:
+        pass
+
+
 UNIDADES = [("Horas", 3600), ("Días", 86400), ("Semanas", 604800), ("Meses", 2592000), ("Años", 31536000)]
 PRESETS = [("1 día", 86400), ("2 días", 172800), ("1 semana", 604800), ("1 mes", 2592000),
            ("3 meses", 7776000), ("6 meses", 15552000), ("1 año", 31536000), ("2 años", 63072000),
            ("De por vida", -1)]
+
+
+_DUR_ES = (("año", "años", 31536000), ("mes", "meses", 2592000), ("semana", "semanas", 604800),
+           ("día", "días", 86400), ("hora", "horas", 3600))
+_DUR_EN = (("year", "years", 31536000), ("month", "months", 2592000), ("week", "weeks", 604800),
+           ("day", "days", 86400), ("hour", "hours", 3600))
 
 
 def fmt_duracion(s):
@@ -221,9 +278,8 @@ def fmt_duracion(s):
         return "—"
     s = int(s)
     if s < 0:
-        return "De por vida"
-    for sing, plur, u in (("año", "años", 31536000), ("mes", "meses", 2592000), ("semana", "semanas", 604800),
-                          ("día", "días", 86400), ("hora", "horas", 3600)):
+        return tr("De por vida")
+    for sing, plur, u in (_DUR_EN if IDIOMA == "en" else _DUR_ES):
         if s >= u and s % u == 0:
             n = s // u
             return f"{n} {sing if n == 1 else plur}"
@@ -232,18 +288,19 @@ def fmt_duracion(s):
 
 def fmt_restante(vence):
     if vence is None:
-        return "Sin licencia"
+        return "Sin licencia" if IDIOMA != "en" else "No license"
     if vence < 0:
-        return "De por vida"
+        return tr("De por vida")
     r = vence - time.time()
     if r <= 0:
-        return "Vencida"
+        return "Vencida" if IDIOMA != "en" else "Expired"
     d, h, m = int(r // 86400), int(r % 86400 // 3600), int(r % 3600 // 60)
+    mn = "min" if IDIOMA != "en" else "min"
     if d >= 1:
         return f"{d} d {h} h"
     if h >= 1:
-        return f"{h} h {m} min"
-    return f"{max(1, m)} min"
+        return f"{h} h {m} {mn}"
+    return f"{max(1, m)} {mn}"
 
 
 def fmt_fecha(ts):
@@ -252,7 +309,6 @@ def fmt_fecha(ts):
     return datetime.fromtimestamp(ts).strftime("%d/%m/%Y %H:%M")
 
 
-# ═════════════════════════ ENTRADA (Windows) ═════════════════════════════
 VK_NOMBRES = {
     0x08: "BACKSPACE", 0x09: "TAB", 0x0D: "ENTER", 0x10: "SHIFT", 0x11: "CTRL", 0x12: "ALT",
     0x14: "MAYÚS", 0x1B: "ESC", 0x20: "ESPACIO", 0x21: "RE PÁG", 0x22: "AV PÁG", 0x23: "FIN",
@@ -329,14 +385,13 @@ if ES_WINDOWS:
         return i
 
     def _mover_absoluto(x, y):
-        """Movimiento REAL del mouse (los juegos lo ven; SetCursorPos no siempre)."""
         vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
         vw, vh = max(2, user32.GetSystemMetrics(78)), max(2, user32.GetSystemMetrics(79))
         nx = int(round((x - vx) * 65535 / (vw - 1)))
         ny = int(round((y - vy) * 65535 / (vh - 1)))
         i = INPUT()
         i.type = 0
-        i.mi = MOUSEINPUT(nx, ny, 0, 0x0001 | 0x8000 | 0x4000, 0, 0)  # MOVE | ABSOLUTE | VIRTUALDESK
+        i.mi = MOUSEINPUT(nx, ny, 0, 0x0001 | 0x8000 | 0x4000, 0, 0)
         _enviar([i])
 
     def hacer_clic(boton="izq", doble=False, pos=None, modo_juego=True, parar=None):
@@ -346,10 +401,8 @@ if ES_WINDOWS:
                 user32.SetCursorPos(int(pos[0]), int(pos[1]))
             _enviar([_mi(d), _mi(u)] * (2 if doble else 1))
             return
-        # Modo juego (Roblox, etc.): los juegos leen el mouse una vez por cuadro (~16 ms).
-        # Un clic "instantaneo" (bajar y subir en el mismo milisegundo) se pierde, asi que:
-        # 1) se manda un movimiento real a la posicion, 2) se mantiene presionado ~40 ms
-        #    (cubre juegos a 30 FPS o mas).
+
+
         esperar = parar.wait if parar else time.sleep
         x, y = pos if pos else posicion_cursor()
         _mover_absoluto(x, y)
@@ -417,7 +470,7 @@ class Motor:
         self.activo, self.contador = False, 0
         self.inicio = self.fin = 0.0
         self.error, self.completado = None, False
-        self.ultimo = time.monotonic()   # ultima vez que el hilo dio señales de vida
+        self.ultimo = time.monotonic()
         self.intervalo = 0.1
 
     def iniciar(self, accion, intervalo, repeticiones=0):
@@ -449,9 +502,9 @@ class Motor:
                 prox += intervalo
                 resto = prox - time.perf_counter()
                 if resto < -0.25:
-                    prox = time.perf_counter()   # la PC se atraso mucho: no "recuperar" de golpe
+                    prox = time.perf_counter()
                 elif resto > 0:
-                    # espera normal y, el ultimo 1.5 ms, ajuste fino para un ritmo exacto
+
                     if resto > 0.002 and parar.wait(resto - 0.0015):
                         break
                     while not parar.is_set() and time.perf_counter() < prox:
@@ -464,14 +517,6 @@ class Motor:
 
 
 class VigilanteAtajos(threading.Thread):
-    """Hilo independiente de la ventana: atajos globales + PROTECCION.
-
-    Aunque la ventana se congele, este hilo sigue funcionando y puede detener todo:
-      - Tecla de emergencia (F8): detiene al instante, sin pasar por la ventana.
-      - Esquina de emergencia: mouse en la esquina superior izquierda = detener todo.
-      - Accion trabada: si un clic/tecla no termina a tiempo, se detiene ese motor.
-      - Ventana congelada: si la interfaz deja de responder, se detiene todo.
-    """
 
     def __init__(self, cola, motores):
         super().__init__(daemon=True)
@@ -494,7 +539,7 @@ class VigilanteAtajos(threading.Thread):
     def _revisar_proteccion(self):
         ahora = time.monotonic()
         activos = [m for m in self.motores.values() if m.activo]
-        # 1) esquina de emergencia
+
         if self.esquina:
             x, y = posicion_cursor()
             vx = user32.GetSystemMetrics(76) if ES_WINDOWS else 0
@@ -507,11 +552,11 @@ class VigilanteAtajos(threading.Thread):
         if not self.vigia or not activos or ahora - self._ultima_revision < 0.5:
             return
         self._ultima_revision = ahora
-        # 2) ventana congelada
+
         if ahora - self.latido_ui > 8.0:
             self.detener_todo("La ventana dejó de responder; se detuvo todo por seguridad")
             return
-        # 3) accion trabada
+
         for m in activos:
             limite = max(5.0, m.intervalo * 2 + 3.0)
             if ahora - m.ultimo > limite:
@@ -526,7 +571,7 @@ class VigilanteAtajos(threading.Thread):
                         ab = tecla_abajo(vk)
                         if ab and not self._prev.get(nombre):
                             if nombre == "stop":
-                                # se detiene aqui mismo: funciona aunque la ventana este trabada
+
                                 self.detener_todo(None)
                             self.cola.put(nombre)
                         self._prev[nombre] = ab
@@ -538,31 +583,170 @@ class VigilanteAtajos(threading.Thread):
             time.sleep(0.02)
 
 
-# ═════════════════════════════ INTERFAZ ═══════════════════════════════════
 import tkinter as tk
 import tkinter.font as tkfont
 
 try:
-    from PIL import Image, ImageDraw, ImageFilter, ImageTk
+    from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
 except ImportError:
     Image = None
 
-BG = "#0b0d14"
-PANEL = "#131722"
-PANEL2 = "#1b2030"
-BORDE = "#283049"
-TEXTO = "#eef0f8"
-SUB = "#8c95b0"
-ACENTO = "#7c5cff"
-ACENTO2 = "#00d4ff"
-OK = "#2ee59d"
-ERROR = "#ff4d6d"
-AVISO = "#ffb84d"
-ORO = "#ffc857"
+TEMAS = {
+    "oscuro": {"BG": "#0b0d14", "PANEL": "#131722", "PANEL2": "#1b2030", "BORDE": "#283049",
+               "TEXTO": "#eef0f8", "SUB": "#8c95b0", "ACENTO": "#7c5cff", "ACENTO2": "#00d4ff",
+               "OK": "#2ee59d", "ERROR": "#ff4d6d", "AVISO": "#ffb84d", "ORO": "#ffc857",
+               "SOMBRA": "#07080d", "SOBRE": "#ffffff", "oscuro": True},
+    "claro": {"BG": "#e9edf6", "PANEL": "#ffffff", "PANEL2": "#eff3fb", "BORDE": "#d4dcec",
+              "TEXTO": "#172036", "SUB": "#5e6a86", "ACENTO": "#6b4dff", "ACENTO2": "#0b93c2",
+              "OK": "#10a267", "ERROR": "#df2f55", "AVISO": "#c17f10", "ORO": "#b2851c",
+              "SOMBRA": "#c6cdda", "SOBRE": "#ffffff", "oscuro": False},
+}
+TEMA = "oscuro"
+ES_OSCURO = True
+BG = PANEL = PANEL2 = BORDE = TEXTO = SUB = ACENTO = ACENTO2 = OK = ERROR = AVISO = ORO = SOMBRA = SOBRE = "#000000"
+
+
+def aplicar_tema(nombre):
+    global TEMA, ES_OSCURO, BG, PANEL, PANEL2, BORDE, TEXTO, SUB
+    global ACENTO, ACENTO2, OK, ERROR, AVISO, ORO, SOMBRA, SOBRE
+    TEMA = nombre if nombre in TEMAS else "oscuro"
+    t = TEMAS[TEMA]
+    BG, PANEL, PANEL2, BORDE = t["BG"], t["PANEL"], t["PANEL2"], t["BORDE"]
+    TEXTO, SUB, ACENTO, ACENTO2 = t["TEXTO"], t["SUB"], t["ACENTO"], t["ACENTO2"]
+    OK, ERROR, AVISO, ORO = t["OK"], t["ERROR"], t["AVISO"], t["ORO"]
+    SOMBRA, SOBRE, ES_OSCURO = t["SOMBRA"], t["SOBRE"], t["oscuro"]
+    try:
+        _CACHE.clear()
+    except NameError:
+        pass
+
+
+aplicar_tema("oscuro")
 FUENTE = "Segoe UI" if ES_WINDOWS else "Helvetica"
 MONO = "Consolas" if ES_WINDOWS else "Courier"
 ESCALA = 1.0
-SS = 3  # supersampling para bordes suaves
+SS = 3
+
+
+IDIOMA = "es"
+_EN = {
+    "Iniciar sesión": "Log in", "Crear cuenta": "Sign up", "Usuario": "Username",
+    "Contraseña": "Password", "Repite la contraseña": "Repeat password",
+    "Inventa un usuario y contraseña. No uses datos reales.": "Make up a username and password. Don't use real details.",
+    "Mantener la sesión iniciada": "Keep me signed in", "Entrar": "Enter", "Conectando…": "Connecting…",
+    "● Servidor en línea": "● Server online", "● Sin conexión con el servidor · reintentando…": "● No connection · retrying…",
+    "● Conectando con el servidor…": "● Connecting to the server…",
+    "Escribe tu usuario y contraseña": "Enter your username and password",
+    "Usuario: 3 a 20 caracteres (letras, números, _ . -)": "Username: 3 to 20 characters (letters, numbers, _ . -)",
+    "La contraseña debe tener al menos 6 caracteres": "The password must be at least 6 characters",
+    "Las contraseñas no coinciden": "The passwords don't match",
+    "Activa tu licencia": "Activate your license", "Licencia": "License", "Activar licencia": "Activate license",
+    "← Cerrar sesión": "← Log out", "La licencia está incompleta": "The license is incomplete",
+    "Verificando…": "Checking…", "Tu licencia venció. Activa una nueva para seguir.": "Your license expired. Activate a new one to continue.",
+    "Mouse": "Mouse", "Teclado": "Keyboard", "Licencias": "Licenses", "Usuarios": "Users", "Cuenta": "Account",
+    "Clics automáticos a la velocidad que elijas.": "Automatic clicks at the speed you choose.",
+    "Repite una tecla una y otra vez.": "Repeat a key over and over.",
+    "Crea licencias y revisa quién las usó.": "Create licenses and see who used them.",
+    "Quién tiene el programa, su licencia y sus permisos.": "Who has the program, their license and permissions.",
+    "Tu información, licencia y ajustes.": "Your information, license and settings.",
+    "Intervalo": "Interval", "milisegundos": "milliseconds", "Botón": "Button", "Izquierdo": "Left",
+    "Derecho": "Right", "Medio": "Middle", "Clic": "Click", "Simple": "Single", "Doble": "Double",
+    "Posición": "Position", "Cursor": "Cursor", "Punto fijo": "Fixed point", "Elegir punto": "Pick point",
+    "Repetir": "Repeat", "Siempre": "Always", "Veces": "Times", "Modo juego": "Game mode",
+    "Roblox y otros juegos": "Roblox and other games",
+    "Clics que los juegos sí detectan.\nApágalo solo si quieres la máxima velocidad.":
+        "Clicks that games actually detect.\nTurn it off only if you want maximum speed.",
+    "Mantiene la tecla 40 ms para que el juego la note.\nApágalo para la máxima velocidad.":
+        "Holds the key 40 ms so the game notices it.\nTurn it off for maximum speed.",
+    "Tecla": "Key", "la que se repite": "the one that repeats", "Cambiar tecla": "Change key",
+    "clics": "clicks", "pulsaciones": "presses", "Tiempo": "Time", "Por seg.": "Per sec.",
+    "CREAR LICENCIAS": "CREATE LICENSES", "Tipo": "Type", "Admin": "Admin",
+    "Duración (empieza al activarla)": "Duration (starts when activated)", "Licencia de ADMIN": "ADMIN license",
+    "Quien la active se convierte en cuenta\nde administrador (permanente).\n\nPodrá crear licencias de usuario,\nver usuarios y banear.":
+        "Whoever activates it becomes an\nadministrator account (permanent).\n\nThey can create user licenses,\nsee users and ban.",
+    "Cantidad": "Amount", "Nota (opcional)": "Note (optional)", "Generar licencias": "Generate licenses",
+    "Se copian solas al portapapeles.": "They're copied to the clipboard automatically.",
+    "LICENCIAS CREADAS": "CREATED LICENSES", "Todas": "All", "Libres": "Free", "Usadas": "Used",
+    "No hay licencias todavía.": "No licenses yet.", "Admin permanente": "Permanent admin", "Copiar": "Copy",
+    "Generando…": "Generating…", "Licencia borrada": "License deleted",
+    "Buscar": "Search", "Todos": "All", "Con licencia": "With license", "Admins": "Admins", "Baneados": "Banned",
+    "Sin resultados.": "No results.", "Banear": "Ban", "Desbanear": "Unban", "BANEADO": "BANNED",
+    "Acceso total": "Full access", "Elige un usuario de la lista\npara ver sus opciones.":
+        "Pick a user from the list\nto see their options.",
+    "Vence": "Expires", "Licencias usadas": "Licenses used", "Última licencia": "Last license",
+    "Creada": "Created", "Última vez": "Last seen",
+    "No tienes permiso para modificar\nesta cuenta.": "You can't modify\nthis account.",
+    "DAR TIEMPO": "GIVE TIME", "Agregar tiempo": "Add time", "Quitar licencia": "Remove license",
+    "Hacer admin": "Make admin", "Quitar admin": "Remove admin", "Eliminar cuenta": "Delete account",
+    "ATAJOS DE TECLADO": "KEYBOARD SHORTCUTS", "Detener todo": "Stop everything",
+    "AL INICIAR CON EL BOTÓN": "WHEN STARTING WITH THE BUTTON",
+    "Espera para que muevas el mouse.": "Delay so you can move the mouse.",
+    "Ventana siempre encima": "Window always on top", "PROTECCIÓN": "PROTECTION",
+    "Esquina de emergencia": "Emergency corner",
+    "Mouse a la esquina superior izquierda = parar": "Mouse to the top-left corner = stop",
+    "Parar si algo se traba": "Stop if something freezes",
+    "Detiene todo si un clic o la ventana se congela": "Stops everything if a click or the window freezes",
+    "Cerrar sesión": "Log out", "Tu ID": "Your ID", "AGREGAR OTRA LICENCIA": "ADD ANOTHER LICENSE",
+    "El tiempo se suma al que ya tienes.": "The time adds to what you already have.", "Canjear": "Redeem",
+    "CAMBIAR CONTRASEÑA": "CHANGE PASSWORD", "Actual": "Current", "Cambiar": "Change",
+    "Nueva (mínimo 6 caracteres)": "New (at least 6 characters)", "De por vida": "Lifetime",
+    "Detenido": "Stopped", "Activo": "Active", "OWNER": "OWNER", "ADMIN": "ADMIN", "USUARIO": "USER",
+    "Nueva versión disponible": "New version available", "Actualizar ahora": "Update now",
+    "Más tarde": "Later", "Descargando…": "Downloading…", "Reiniciando…": "Restarting…", "Reintentar": "Retry",
+    "APARIENCIA": "APPEARANCE", "Tema": "Theme", "Oscuro": "Dark", "Claro": "Light", "Idioma": "Language",
+    "Sonido al iniciar y detener": "Sound on start and stop", "Español": "Spanish", "Inglés": "English",
+    "INICIAR": "START", "DETENER": "STOP", "CANCELAR": "CANCEL",
+    "Falta la librería Pillow.\nAbre CMD y ejecuta:  pip install pillow":
+        "Pillow is missing.\nOpen CMD and run:  pip install pillow",
+    "Pon el mouse donde quieres el clic…": "Put the mouse where you want the click…",
+    "Esa tecla no se puede usar": "That key can't be used", "¿Borrar?": "Delete?", "¿Seguro?": "Sure?",
+    "Esa tecla ya se usa en otro atajo": "That key is already used by another shortcut",
+    "Presiona una tecla…": "Press a key…", "Presiona…": "Press…",
+    "Tu licencia no está activa": "Your license is not active",
+    "Los clics solo funcionan en Windows": "Clicks only work on Windows", "Todo detenido": "Everything stopped",
+    "Cuenta creada. ¡Bienvenido!": "Account created. Welcome!", "ID copiado": "ID copied",
+    "Licencia copiada": "License copied", "Escribe tu contraseña actual": "Enter your current password",
+    "La nueva debe tener al menos 6 caracteres": "The new one must be at least 6 characters",
+    "Ahora eres administrador": "You're an administrator now",
+    "Contraseña cambiada. Se cerró la sesión en tus otras PCs.": "Password changed. Your other PCs were signed out.",
+    "Autoclicker de mouse y teclado · v{v}": "Mouse and keyboard autoclicker · v{v}",
+    "Hola {n}, pega la licencia que te dieron.\nCada licencia se puede usar una sola vez.":
+        "Hi {n}, paste the license you were given.\nEach license can be used only once.",
+    "Tu ID: {id}": "Your ID: {id}", "Atajo:  {k}": "Shortcut:  {k}",
+    "Emergencia: {k}": "Emergency: {k}", "o mouse a la esquina ↖": "or mouse to the corner ↖",
+    "Listo: {n} {u}": "Done: {n} {u}", "Hola, {n}": "Hi, {n}",
+    "Se agregó {d}": "Added {d}", "Punto guardado: {x}, {y}": "Point saved: {x}, {y}",
+    "Elige en {n}…": "Pick in {n}…", "{k} es un atajo. Elige otra.": "{k} is a shortcut. Pick another.",
+    "Atajo cambiado a {k}": "Shortcut changed to {k}", "{n} cuenta · {c} con acceso": "{n} account · {c} with access",
+    "{n} cuentas · {c} con acceso": "{n} accounts · {c} with access",
+    "Mostrando {m} de {n} · usa el buscador": "Showing {m} of {n} · use the search box",
+    "{n} baneado": "{n} banned", "{n} desbaneado": "{n} unbanned", "Usuario baneado": "User banned",
+    "Usuario desbaneado": "User unbanned", "Licencia quitada": "License removed",
+    "Ya no es admin": "No longer admin", "Ahora es admin": "Now admin", "Cuenta eliminada": "Account deleted",
+    "Se agregó {d}": "Added {d}", "{n} licencia(s) de {d} copiadas": "{n} license(s) of {d} copied",
+    "Licencia activada: {d}": "License activated: {d}",
+    "Acceso total ({r})": "Full access ({r})", "{r} restantes · vence {f}": "{r} left · expires {f}",
+    "No se pudo conectar con el servidor": "Couldn't connect to the server",
+    "Error del servidor ({c})": "Server error ({c})", "Tu cuenta está suspendida": "Your account is suspended",
+    "Sesión expirada. Inicia sesión de nuevo.": "Session expired. Log in again.",
+    "Usuario o contraseña incorrectos": "Wrong username or password", "Ese usuario ya existe": "That username already exists",
+    "Esta licencia ya fue usada": "This license was already used", "Licencia inválida": "Invalid license",
+    "Demasiados intentos. Espera unos minutos.": "Too many attempts. Wait a few minutes.",
+    "1 día": "1 day", "2 días": "2 days", "1 semana": "1 week", "1 mes": "1 month", "3 meses": "3 months",
+    "6 meses": "6 months", "1 año": "1 year", "2 años": "2 years", "Por vida": "Lifetime",
+    "10 ms": "10 ms", "100 ms": "100 ms", "1 seg": "1 sec", "↻": "↻",
+}
+_UNIDADES_EN = {"Horas": "Hours", "Días": "Days", "Semanas": "Weeks", "Meses": "Months", "Años": "Years",
+                "Sem.": "Wk."}
+
+
+def tr(s, **kw):
+    s = str(s)
+    base = (_EN.get(s) or _UNIDADES_EN.get(s) or s) if IDIOMA == "en" else s
+    try:
+        return base.format(**kw) if kw else base
+    except (KeyError, IndexError, ValueError):
+        return base
 
 
 def px(v):
@@ -578,7 +762,7 @@ def _rgb(h):
 
 
 def mezclar(a, b, t):
-    t = round(max(0.0, min(1.0, t)) * 16) / 16  # cuantizado: menos imagenes distintas
+    t = round(max(0.0, min(1.0, t)) * 16) / 16
     ra, rb = _rgb(a), _rgb(b)
     return "#%02x%02x%02x" % tuple(int(ra[i] + (rb[i] - ra[i]) * t) for i in range(3))
 
@@ -608,7 +792,6 @@ _FUENTES = {}
 
 
 def medir(texto, tam, peso="normal"):
-    """Ancho en pixeles de un texto (las fuentes se crean una sola vez)."""
     f = _FUENTES.get((tam, peso))
     if f is None:
         f = _FUENTES[(tam, peso)] = tkfont.Font(family=FUENTE, size=tam, weight=peso)
@@ -616,14 +799,12 @@ def medir(texto, tam, peso="normal"):
 
 
 def minimizada(w):
-    """True si la ventana esta minimizada: las animaciones se pausan para no gastar CPU."""
     try:
         return w.winfo_toplevel().state() == "iconic"
     except tk.TclError:
         return False
 
 
-# ─────────────────── imagenes suavizadas (antialias) ────────────────────
 _CACHE = OrderedDict()
 
 
@@ -692,7 +873,7 @@ def img_ojo(w, h, color, tachado):
 
 def img_glow(r, color):
     def crear():
-        # se dibuja pequeño (rapido) con margen de 3 sigmas para que el difuminado llegue a 0
+
         k = 4
         rr = r / k
         sigma = rr * 0.6
@@ -717,6 +898,17 @@ def img_logo(S, t):
         im.putalpha(m)
         return im.resize((S, S), Image.LANCZOS)
     return _foto(("logo", S, t), crear)
+
+
+def img_logo_personal(S, version):
+    def crear():
+        Z = S * SS
+        im = ImageOps.fit(LOGO["pil"], (Z, Z), Image.LANCZOS, centering=(0.5, 0.5))
+        m = Image.new("L", (Z, Z), 0)
+        ImageDraw.Draw(m).rounded_rectangle((0, 0, Z - 1, Z - 1), radius=int(Z * 0.28), fill=255)
+        im.putalpha(m)
+        return im.resize((S, S), Image.LANCZOS)
+    return _foto(("logop", S, version), crear)
 
 
 def img_power(S, color="#ffffff"):
@@ -777,7 +969,6 @@ class Anim:
 
 
 class Lienzo(tk.Canvas):
-    """Canvas que guarda referencias a sus imagenes (evita que desaparezcan)."""
 
     def __init__(self, master, w, h, bg=None, **kw):
         self.pbg = bg or master.cget("bg")
@@ -806,7 +997,6 @@ class Lienzo(tk.Canvas):
 
 
 class Boton(Lienzo):
-    """Boton redondeado: se eleva con el mouse y rebota al hacer clic."""
 
     def __init__(self, master, texto, command=None, ancho=150, alto=40, estilo="primario",
                  fuente=None, bg=None, color=None):
@@ -836,14 +1026,16 @@ class Boton(Lienzo):
             if self.estilo == "primario":
                 fill = mezclar(mezclar(self.color, "#ffffff", 0.14 * self.ht), "#ffffff", 0.3 * self.flash)
                 out = None
+                fg = SOBRE
             else:
                 fill = mezclar(mezclar(self.color, BORDE, 0.6 * self.ht), "#ffffff", 0.15 * self.flash)
                 out = mezclar(BORDE, ACENTO, self.ht)
-            fg = TEXTO
+                fg = TEXTO
             if self.ht > 0.05:
-                self.img(x + px(2), y + px(4) + lift, img_rr(w - px(4), h, r, fill=(0, 0, 0, int(90 * self.ht))))
+                sombra = _rgb(SOMBRA) + (int((70 if ES_OSCURO else 120) * self.ht),)
+                self.img(x + px(2), y + px(4) + lift, img_rr(w - px(4), h, r, fill=sombra))
         self.img(x, y, img_rr(w, h, r, fill=fill, outline=out, ow=1))
-        self.create_text(x + w / 2, y + h / 2, text=self.texto, fill=fg, font=self.fuente)
+        self.create_text(x + w / 2, y + h / 2, text=tr(self.texto), fill=fg, font=self.fuente)
 
     def _salir(self, _e):
         self.animar("ht", 0, 220)
@@ -913,7 +1105,6 @@ class Interruptor(Lienzo):
 
 
 class Segmentado(Lienzo):
-    """Opciones con una pastilla que se desliza a la elegida."""
 
     def __init__(self, master, opciones, indice=0, command=None, ancho=None, alto=34, bg=None):
         self.ops = list(opciones)
@@ -941,7 +1132,7 @@ class Segmentado(Lienzo):
         for i, o in enumerate(self.ops):
             cerca = max(0.0, 1 - abs(self.pos - i))
             col = mezclar(SUB, "#ffffff", max(cerca, 0.55 if i == self.hover else 0))
-            self.create_text(seg * i + seg / 2, self.H / 2, text=o, fill=col, font=F(9, "bold"))
+            self.create_text(seg * i + seg / 2, self.H / 2, text=tr(o), fill=col, font=F(9, "bold"))
 
     def set(self, i, notificar=False):
         cambio = i != self.idx
@@ -959,7 +1150,6 @@ class Segmentado(Lienzo):
 
 
 class Campo(Lienzo):
-    """Caja de texto redondeada cuyo borde se ilumina al escribir."""
 
     def __init__(self, master, ancho=260, alto=40, show="", justify="left", fuente=None, bg=None, ojo=False):
         self.W, self.H = px(ancho), px(alto)
@@ -1021,7 +1211,6 @@ class Campo(Lienzo):
 
 
 class Tarjeta(tk.Frame):
-    """Panel con esquinas redondeadas. Los widgets van dentro de .cuerpo"""
 
     def __init__(self, master, pad=20, color=PANEL, borde=BORDE):
         super().__init__(master, bg=master.cget("bg"))
@@ -1056,12 +1245,6 @@ class Tarjeta(tk.Frame):
 
 
 class TarjetaFlotante:
-    """Tarjeta dibujada directamente sobre el fondo animado.
-
-    Tk no tiene transparencia entre widgets: una Tarjeta normal dejaria esquinas del
-    color de fondo liso encima de las luces. Aqui el panel redondeado se pinta en el
-    mismo lienzo del fondo (con transparencia real) y solo el contenido es un Frame.
-    """
 
     def __init__(self, fondo, pad=30, radio=16):
         self.fondo, self.pad, self.r = fondo, px(pad), px(radio)
@@ -1094,6 +1277,7 @@ class Toast:
         self.root, self.c, self.anim = root, None, Anim(root)
 
     def mostrar(self, msg, tipo="info", ms=2600):
+        msg = tr(msg)
         col = {"ok": OK, "error": ERROR, "aviso": AVISO}.get(tipo, ACENTO2)
         ico = {"ok": "✔", "error": "✖", "aviso": "⚠"}.get(tipo, "ℹ")
         if self.c is not None:
@@ -1108,7 +1292,7 @@ class Toast:
         c.create_text(px(22), H / 2, text=ico, fill=col, font=F(12, "bold"))
         c.create_text(px(42), H / 2, text=msg, fill=TEXTO, font=F(10), anchor="w")
         c.place(relx=0.5, y=-px(60), anchor="n")
-        tk.Misc.tkraise(c)  # (en un Canvas, .lift() mueve dibujos, no la ventana)
+        tk.Misc.tkraise(c)
         self.c = c
 
         def irse():
@@ -1126,7 +1310,6 @@ class Toast:
 
 
 class FondoAnimado(Lienzo):
-    """Luces difuminadas que flotan lentamente."""
 
     def __init__(self, master):
         super().__init__(master, 10, 10, bg=BG)
@@ -1164,14 +1347,25 @@ class Logo(Lienzo):
         self.S = px(tam)
         super().__init__(master, self.S, self.S, bg=bg)
         self.f = random.uniform(0, 6)
+        self._modo = None
+        self._ver = -1
         self._loop()
 
     def _loop(self):
         try:
-            if not minimizada(self):
+            if LOGO["pil"] is not None:
+                if self._modo != "personal" or self._ver != LOGO["version"]:
+                    self._modo, self._ver = "personal", LOGO["version"]
+                    self.limpiar()
+                    self._fondo = self.img(0, 0, img_logo_personal(self.S, LOGO["version"]))
+            elif not minimizada(self):
+                nuevo = self._modo != "al"
+                if nuevo:
+                    self._modo = "al"
+                    self.limpiar()
                 self.f += 0.05
                 foto = img_logo(self.S, (math.sin(self.f) + 1) / 2)
-                if not self.refs:
+                if nuevo:
                     self._fondo = self.img(0, 0, foto)
                     self.create_text(self.S / 2, self.S / 2, text="AL", fill="#ffffff",
                                      font=(FUENTE, max(8, int(self.S / ESCALA * 0.3)), "bold"))
@@ -1253,7 +1447,6 @@ class BotonPower(Lienzo):
             self._pulso()
 
     def cuenta_regresiva(self, n, al_terminar):
-        """Muestra n, n-1 ... 1 (un segundo cada uno) y luego llama a al_terminar."""
         self.cancelar_cuenta(False)
         self.estado, self.cuenta = "cuenta", n
 
@@ -1344,10 +1537,10 @@ class Candado(Lienzo):
 
 
 class Insignia(Lienzo):
-    """Etiqueta de rol: OWNER / ADMIN / USUARIO."""
 
     def __init__(self, master, rol, bg=None):
         txt, col = {"owner": ("OWNER", ORO), "admin": ("ADMIN", ACENTO2)}.get(rol, ("USUARIO", SUB))
+        txt = tr(txt)
         W, H = medir(txt, 7, "bold") + px(16), px(20)
         super().__init__(master, W, H, bg=bg)
         self.img(0, 0, img_rr(W, H, px(6), fill=mezclar(master.cget("bg"), col, 0.18), outline=col))
@@ -1365,7 +1558,6 @@ class Avatar(Lienzo):
 
 
 class Navegacion(Lienzo):
-    """Menu lateral: un resaltado se desliza hasta la seccion elegida."""
 
     def __init__(self, master, items, command, ancho=176):
         self.items, self.command = items, command
@@ -1415,11 +1607,10 @@ class Navegacion(Lienzo):
             act = i == self.sel
             col = "#ffffff" if act else (TEXTO if i == self.hover else SUB)
             self.create_text(px(26), y, text=ico, fill=ACENTO2 if act else col, font=F(12))
-            self.create_text(px(48), y, text=txt, fill=col, font=F(10, "bold"), anchor="w")
+            self.create_text(px(48), y, text=tr(txt), fill=col, font=F(10, "bold"), anchor="w")
 
 
 class ListaScroll(tk.Frame):
-    """Lista con scroll de rueda del mouse (sin barra visible)."""
 
     def __init__(self, master, bg=PANEL):
         super().__init__(master, bg=bg)
@@ -1440,10 +1631,8 @@ class ListaScroll(tk.Frame):
         self.c.yview_moveto(0)
 
 
-# ─────────────────────────── utilidades UI ────────────────────────────
-
 def etiqueta(master, texto, tam=10, color=SUB, peso="normal", **kw):
-    return tk.Label(master, text=texto, bg=master.cget("bg"), fg=color, font=F(tam, peso), **kw)
+    return tk.Label(master, text=tr(texto), bg=master.cget("bg"), fg=color, font=F(tam, peso), **kw)
 
 
 def enlace(master, texto, cb, color=SUB):
@@ -1470,7 +1659,6 @@ def leer_entero(texto, minimo, maximo, nombre):
 
 
 def registrar_error(texto):
-    """Guarda errores en %APPDATA%\\AutoClickerAL\\errores.log para poder revisarlos."""
     try:
         base = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "AutoClickerAL")
         os.makedirs(base, exist_ok=True)
@@ -1484,12 +1672,11 @@ def registrar_error(texto):
 
 
 def seguro(fn):
-    """Envuelve callbacks que pueden llegar cuando la pantalla ya se cerro."""
     def w(*a, **k):
         try:
             return fn(*a, **k)
         except tk.TclError as e:
-            # si el widget sigue vivo, no es "pantalla cerrada": es un error real
+
             if "invalid command name" not in str(e) and "bad window path" not in str(e):
                 import traceback
                 registrar_error(traceback.format_exc())
@@ -1497,7 +1684,6 @@ def seguro(fn):
 
 
 def puede_editar(yo, u):
-    """Mismas reglas que el servidor: el owner es intocable y los admins solo los toca el owner."""
     if u["rol"] == "owner":
         return False
     if u["rol"] == "admin":
@@ -1506,7 +1692,6 @@ def puede_editar(yo, u):
 
 
 class SelectorDuracion(tk.Frame):
-    """Atajos (1 dia, 1 semana...) + duracion personalizada + de por vida."""
 
     def __init__(self, master, presets=PRESETS, cols=3, ancho_chip=108):
         super().__init__(master, bg=master.cget("bg"))
@@ -1561,8 +1746,6 @@ class SelectorDuracion(tk.Frame):
         return s
 
 
-# ═══════════════════════════ PANTALLA: CUENTA ════════════════════════════
-
 class PantallaAuth(tk.Frame):
     def __init__(self, app):
         super().__init__(app, bg=BG)
@@ -1579,7 +1762,7 @@ class PantallaAuth(tk.Frame):
         t = tk.Frame(cab, bg=PANEL)
         t.pack(side="left", padx=px(12))
         etiqueta(t, APP_NOMBRE, 18, TEXTO, "bold").pack(anchor="w")
-        etiqueta(t, f"Autoclicker de mouse y teclado · v{APP_VERSION}", 9).pack(anchor="w")
+        etiqueta(t, tr("Autoclicker de mouse y teclado · v{v}", v=APP_VERSION), 9).pack(anchor="w")
 
         self.tabs = Segmentado(c, ["Iniciar sesión", "Crear cuenta"], 0, command=self._construir,
                                ancho=330, alto=38)
@@ -1600,11 +1783,11 @@ class PantallaAuth(tk.Frame):
         self.app.api("GET", "/api/ping", None, seguro(self._en_linea), seguro(self._sin_conexion))
 
     def _en_linea(self, _r):
-        self.estado.config(text="● Servidor en línea", fg=OK)
+        self.estado.config(text=tr("● Servidor en línea"), fg=OK)
         self.app.intentar_auto_login()
 
     def _sin_conexion(self, _e):
-        self.estado.config(text="● Sin conexión con el servidor · reintentando…", fg=ERROR)
+        self.estado.config(text=tr("● Sin conexión con el servidor · reintentando…"), fg=ERROR)
         self._reintento = self.after(5000, seguro(self.verificar_servidor))
 
     def _construir(self, modo):
@@ -1644,7 +1827,7 @@ class PantallaAuth(tk.Frame):
         self.anim.run("form", 300, lambda t: self.form.pack_configure(padx=(int(px(30) * (1 - t)), 0)))
 
     def _error(self, msg):
-        self.lbl_error.config(text=msg)
+        self.lbl_error.config(text=tr(msg))
         self.btn.set_habilitado(True)
         self.btn.set_texto("Entrar" if self.modo == 0 else "Crear cuenta")
         sacudir(self.card, self.anim)
@@ -1671,10 +1854,7 @@ class PantallaAuth(tk.Frame):
                      seguro(lambda e: self._error(e.msg)))
 
 
-# ═══════════════════════════ PANTALLA: LICENCIA ══════════════════════════
-
 def formatear_clave(campo):
-    """Convierte lo que se escribe en AL-XXXX-XXXX-XXXX-XXXX."""
     est = {"ocupado": False}
 
     def fn(*_):
@@ -1706,9 +1886,9 @@ class PantallaLicencia(tk.Frame):
         self.candado.pack()
         etiqueta(c, "Activa tu licencia", 17, TEXTO, "bold").pack(pady=(px(6), px(2)))
         yo = app.yo
-        etiqueta(c, aviso or f"Hola {yo['nombre']}, pega la licencia que te dieron.\nCada licencia se puede usar una sola vez.",
+        etiqueta(c, aviso or tr("Hola {n}, pega la licencia que te dieron.\nCada licencia se puede usar una sola vez.", n=yo['nombre']),
                  9, AVISO if aviso else SUB, justify="center").pack()
-        etiqueta(c, f"Tu ID: {yo['id']}", 9, ACENTO2, "bold").pack(pady=(px(8), 0))
+        etiqueta(c, tr("Tu ID: {id}", id=yo['id']), 9, ACENTO2, "bold").pack(pady=(px(8), 0))
         etiqueta(c, "Licencia", 9, SUB, "bold").pack(anchor="w", pady=(px(12), px(4)))
         self.campo = Campo(c, ancho=360, alto=46, fuente=(MONO, 13, "bold"), justify="center")
         self.campo.pack()
@@ -1722,7 +1902,7 @@ class PantallaLicencia(tk.Frame):
         self.after(80, seguro(self.campo.e.focus_set))
 
     def _error(self, msg):
-        self.lbl_error.config(text=msg)
+        self.lbl_error.config(text=tr(msg))
         self.btn.set_habilitado(True)
         self.btn.set_texto("Activar licencia")
         sacudir(self.card, self.anim)
@@ -1739,11 +1919,9 @@ class PantallaLicencia(tk.Frame):
     def _ok(self, r):
         self.app.yo = r["yo"]
         self.lbl_error.config(text="")
-        self.app.toast.mostrar(f"Licencia activada: {fmt_duracion(r['duracion'])}", "ok")
+        self.app.toast.mostrar(tr("Licencia activada: {d}", d=fmt_duracion(r['duracion'])), "ok")
         self.candado.abrir(lambda: self.after(250, lambda: self.app.mostrar(PantallaPrincipal)))
 
-
-# ═══════════════════════════ PANTALLA: PRINCIPAL ══════════════════════════
 
 class Pagina(tk.Frame):
     titulo = subtitulo = ""
@@ -1807,17 +1985,17 @@ class PaginaClicker(Pagina):
     def _stat(self, master, t, v):
         f = tk.Frame(master, bg=PANEL2, padx=px(8), pady=px(6))
         f.pack(side="left", expand=True, fill="x", padx=px(3))
-        tk.Label(f, text=t, bg=PANEL2, fg=SUB, font=F(8)).pack()
+        tk.Label(f, text=tr(t), bg=PANEL2, fg=SUB, font=F(8)).pack()
         l = tk.Label(f, text=v, bg=PANEL2, fg=TEXTO, font=F(11, "bold"))
         l.pack()
         return l
 
     def refrescar_atajo(self):
         aj = self.app.ajustes()
-        self.lbl_atajo.config(text=f"Atajo:  {nombre_vk(aj[self.atajo])}")
-        txt = f"Emergencia: {nombre_vk(aj['hk_stop'])}"
+        self.lbl_atajo.config(text=tr("Atajo:  {k}", k=nombre_vk(aj[self.atajo])))
+        txt = tr("Emergencia: {k}", k=nombre_vk(aj['hk_stop']))
         if aj.get("esquina", True):
-            txt += "\no mouse a la esquina ↖"
+            txt += "\n" + tr("o mouse a la esquina ↖")
         self.lbl_emerg.config(text=txt)
 
     def fila_intervalo(self):
@@ -1866,10 +2044,11 @@ class PaginaClicker(Pagina):
             self.lbl_cps.config(text=f"{(real / dur) if dur > 0.2 else 0:.1f}")
         if self._estaba and not m.activo:
             self.power.set_on(False)
+            reproducir("off")
             if m.error:
                 self.app.toast.mostrar(m.error, "error")
             elif m.completado:
-                self.app.toast.mostrar(f"Listo: {real:,} {self.unidad}", "ok")
+                self.app.toast.mostrar(tr("Listo: {n} {u}", n=f"{real:,}", u=tr(self.unidad)), "ok")
         self._estaba = m.activo
 
 
@@ -1912,9 +2091,9 @@ class PaginaMouse(PaginaClicker):
                 self.punto = posicion_cursor()
                 self.b_punto.set_habilitado(True)
                 self._pos(1)
-                self.app.toast.mostrar(f"Punto guardado: {self.punto[0]}, {self.punto[1]}", "ok")
+                self.app.toast.mostrar(tr("Punto guardado: {x}, {y}", x=self.punto[0], y=self.punto[1]), "ok")
                 return
-            self.b_punto.set_texto(f"Elige en {n}…")
+            self.b_punto.set_texto(tr("Elige en {n}…", n=n))
             self.after(1000, seguro(lambda: paso(n - 1)))
         paso(3)
 
@@ -1964,7 +2143,7 @@ class PaginaTeclado(PaginaClicker):
         if not vk:
             self.app.toast.mostrar("Esa tecla no se puede usar", "aviso")
         elif vk in self.app.vks_atajo():
-            self.app.toast.mostrar(f"{nombre_vk(vk)} es un atajo. Elige otra.", "aviso")
+            self.app.toast.mostrar(tr("{k} es un atajo. Elige otra.", k=nombre_vk(vk)), "aviso")
         else:
             self.vk = vk
             self.tecla.set(nombre_vk(vk))
@@ -2117,7 +2296,7 @@ class PaginaLicencias(Pagina):
             self.btn.set_texto("Generar licencias")
             self.nuevas = set(r["claves"])
             desc = "admin" if tipo == "admin" else fmt_duracion(seg)
-            self.app.copiar("\n".join(r["claves"]), f"{len(r['claves'])} licencia(s) de {desc} copiadas")
+            self.app.copiar("\n".join(r["claves"]), tr("{n} licencia(s) de {d} copiadas", n=len(r['claves']), d=desc))
             self.filtro.set(0)
             self.cargar()
 
@@ -2129,7 +2308,6 @@ class PaginaLicencias(Pagina):
                                                     "nota": self.c_nota.get().strip()}, seguro(ok), seguro(err))
 
     def _borrar(self, clave, etiqueta_x):
-        """Primer clic: pide confirmar. Segundo clic (en 3 s): borra."""
         if etiqueta_x.cget("text") == "✕":
             etiqueta_x.config(text="¿Borrar?", fg=ERROR)
             etiqueta_x.after(3000, seguro(lambda: etiqueta_x.config(text="✕", fg=SUB)))
@@ -2175,7 +2353,6 @@ class PaginaUsuarios(Pagina):
         self.cargar()
 
     def _programar_pintado(self):
-        """Espera a que dejes de escribir (180 ms) para no redibujar en cada letra."""
         if self._job_buscar:
             self.after_cancel(self._job_buscar)
         self._job_buscar = self.after(180, seguro(self._pintar))
@@ -2202,13 +2379,14 @@ class PaginaUsuarios(Pagina):
         filas = [u for u in self.datos if pruebas[f](u) and (not b or b in u["nombre"].lower() or b in str(u["id"]))]
         con = sum(1 for u in self.datos if u["acceso"] and not u["baneado"])
         n = len(self.datos)
-        self.lbl_cuenta.config(text=f"{n} cuenta{'' if n == 1 else 's'} · {con} con acceso")
+        clave = "{n} cuenta · {c} con acceso" if n == 1 else "{n} cuentas · {c} con acceso"
+        self.lbl_cuenta.config(text=tr(clave, n=n, c=con))
         if not filas:
             etiqueta(self.lista.inner, "Sin resultados.", 9).pack(pady=px(20))
         for u in filas[:self.MAX_FILAS]:
             self._fila(u)
         if len(filas) > self.MAX_FILAS:
-            etiqueta(self.lista.inner, f"Mostrando {self.MAX_FILAS} de {len(filas)} · usa el buscador",
+            etiqueta(self.lista.inner, tr("Mostrando {m} de {n} · usa el buscador", m=self.MAX_FILAS, n=len(filas)),
                      8).pack(pady=px(10))
 
     def _fila(self, u):
@@ -2235,7 +2413,7 @@ class PaginaUsuarios(Pagina):
             ban.pack(side="right")
             ban.bind("<Button-1>", lambda e, u=u: (self._accion(
                 u, "desbanear" if u["baneado"] else "banear",
-                f"{u['nombre']} desbaneado" if u["baneado"] else f"{u['nombre']} baneado"), "break")[1])
+                tr("{n} desbaneado" if u["baneado"] else "{n} baneado", n=u['nombre'])), "break")[1])
         tk.Label(fr, text=est, bg=bg, fg=col, font=F(9, "bold")).pack(side="right", padx=(0, px(6)))
         Insignia(fr, u["rol"], bg=bg).pack(side="right", padx=px(8))
         pend = [fr]
@@ -2293,7 +2471,7 @@ class PaginaUsuarios(Pagina):
                 s = dur.segundos()
             except ValueError as e:
                 return self.app.toast.mostrar(str(e), "error")
-            self._accion(u, "dar_tiempo", f"Se agregó {fmt_duracion(s)}", duracion=s)
+            self._accion(u, "dar_tiempo", tr("Se agregó {d}", d=fmt_duracion(s)), duracion=s)
         Boton(d, "Agregar tiempo", dar, ancho=284, alto=38).pack(pady=(px(8), px(10)))
         g = tk.Frame(d, bg=PANEL)
         g.pack()
@@ -2419,17 +2597,32 @@ class PaginaCuenta(Pagina):
             etiqueta(t, txt, 10, TEXTO).pack(anchor="w")
             etiqueta(t, ayuda, 8).pack(anchor="w")
             Interruptor(f, app.ajustes()[clave], command=lambda v, c=clave: self._proteccion(c, v)).pack(side="right")
+        etiqueta(d, "APARIENCIA", 8, ACENTO2, "bold").pack(anchor="w", pady=(px(16), px(4)))
+        f = tk.Frame(d, bg=PANEL)
+        f.pack(fill="x", pady=px(3))
+        etiqueta(f, "Tema", 10, TEXTO).pack(side="left")
+        Segmentado(f, ["Oscuro", "Claro"], 0 if TEMA == "oscuro" else 1,
+                   command=lambda i: self._tema("oscuro" if i == 0 else "claro"), ancho=160, alto=32).pack(side="right")
+        f = tk.Frame(d, bg=PANEL)
+        f.pack(fill="x", pady=px(3))
+        etiqueta(f, "Idioma", 10, TEXTO).pack(side="left")
+        Segmentado(f, ["Español", "Inglés"], 0 if IDIOMA == "es" else 1,
+                   command=lambda i: self._idioma("es" if i == 0 else "en"), ancho=160, alto=32).pack(side="right")
+        f = tk.Frame(d, bg=PANEL)
+        f.pack(fill="x", pady=px(3))
+        etiqueta(f, "Sonido al iniciar y detener", 10, TEXTO).pack(side="left")
+        Interruptor(f, SONIDO["on"], command=self._sonido).pack(side="right")
         Boton(d, "Cerrar sesión", app.cerrar_sesion, ancho=250, alto=40,
-              color=mezclar(PANEL, ERROR, 0.7)).pack(side="bottom")
+              color=mezclar(PANEL, ERROR, 0.7)).pack(side="bottom", pady=(px(14), 0))
 
     def _pintar_lic(self):
         yo = self.app.yo
         if yo["rol"] != "user":
-            txt = "Acceso total (" + ("owner" if yo["rol"] == "owner" else "admin") + ")"
+            txt = tr("Acceso total ({r})", r=yo["rol"])
         elif yo["vence"] is not None and yo["vence"] < 0:
-            txt = "De por vida"
+            txt = tr("De por vida")
         else:
-            txt = f"{fmt_restante(yo['vence'])} restantes · vence {fmt_fecha(yo['vence'])}"
+            txt = tr("{r} restantes · vence {f}", r=fmt_restante(yo['vence']), f=fmt_fecha(yo['vence']))
         self.lbl_lic.config(text=txt)
 
     def al_mostrar(self):
@@ -2444,7 +2637,7 @@ class PaginaCuenta(Pagina):
             if r["tipo"] == "admin":
                 self.app.toast.mostrar("Ahora eres administrador", "ok")
             else:
-                self.app.toast.mostrar(f"Se agregó {fmt_duracion(r['duracion'])}", "ok")
+                self.app.toast.mostrar(tr("Se agregó {d}", d=fmt_duracion(r['duracion'])), "ok")
             self.app.aplicar_yo(r["yo"])
         self.app.api("POST", "/api/canjear", {"clave": self.c_lic.get()}, seguro(ok))
 
@@ -2482,6 +2675,25 @@ class PaginaCuenta(Pagina):
         self._set("encima", v)
         self.app.attributes("-topmost", v)
 
+    def _tema(self, nombre):
+        self.app.local.datos["tema"] = nombre
+        self.app.local.guardar()
+        self.app.after(60, lambda: self.app.recargar(self.principal.actual))
+
+    def _idioma(self, codigo):
+        global IDIOMA
+        IDIOMA = codigo
+        self.app.local.datos["idioma"] = codigo
+        self.app.local.guardar()
+        self.app.after(60, lambda: self.app.recargar(self.principal.actual))
+
+    def _sonido(self, v):
+        SONIDO["on"] = bool(v)
+        self.app.local.datos["sonido"] = bool(v)
+        self.app.local.guardar()
+        if v:
+            reproducir("on")
+
     def _hk(self, k):
         if self.capt:
             return
@@ -2503,7 +2715,7 @@ class PaginaCuenta(Pagina):
             self.app.local.guardar()
             self.app.aplicar_atajos()
             self.principal.refrescar_atajos()
-            self.app.toast.mostrar(f"Atajo cambiado a {nombre_vk(vk)}", "ok")
+            self.app.toast.mostrar(tr("Atajo cambiado a {k}", k=nombre_vk(vk)), "ok")
         self.b_hk[k].set_texto(nombre_vk(aj[k]))
         self.b_hk[k].set_color(PANEL2)
         self.capt = None
@@ -2512,9 +2724,10 @@ class PaginaCuenta(Pagina):
 
 
 class PantallaPrincipal(tk.Frame):
-    def __init__(self, app):
+    def __init__(self, app, inicio=0):
         super().__init__(app, bg=BG)
         self.app, self.anim = app, Anim(self)
+        self._inicio = inicio
         yo = app.yo
         es_admin = yo["rol"] in ("owner", "admin")
 
@@ -2545,8 +2758,8 @@ class PantallaPrincipal(tk.Frame):
             f.pack(fill="x", pady=px(2))
             dot = tk.Label(f, text="●", bg=PANEL, fg=BORDE, font=F(9))
             dot.pack(side="left")
-            tk.Label(f, text=txt, bg=PANEL, fg=SUB, font=F(9)).pack(side="left", padx=px(6))
-            st = tk.Label(f, text="Detenido", bg=PANEL, fg=SUB, font=F(8))
+            tk.Label(f, text=tr(txt), bg=PANEL, fg=SUB, font=F(9)).pack(side="left", padx=px(6))
+            st = tk.Label(f, text=tr("Detenido"), bg=PANEL, fg=SUB, font=F(8))
             st.pack(side="right")
             self.puntos[clave] = (dot, st)
         self.tarjeta_usr = tk.Frame(est, bg=PANEL)
@@ -2559,7 +2772,8 @@ class PantallaPrincipal(tk.Frame):
         self.mouse, self.teclado = self.paginas[0], self.paginas[1]
         self.actual = None
         self._parp = 0
-        self.after(20, seguro(lambda: self.ir(0, False)))
+        inicio = self._inicio if self._inicio < len(self.paginas) else 0
+        self.after(20, seguro(lambda: self.ir(inicio, False)))
 
     def refrescar_usuario(self):
         for w in self.tarjeta_usr.winfo_children():
@@ -2624,6 +2838,7 @@ class PantallaPrincipal(tk.Frame):
             motor.iniciar(accion, iv, rep)
             pag._mostrado, pag._estaba = 0, True
             pag.power.set_on(True)
+            reproducir("on")
         r = self.app.ajustes()["retraso"]
         if desde_boton and r > 0:
             pag.power.cuenta_regresiva(r, arrancar)
@@ -2645,16 +2860,15 @@ class PantallaPrincipal(tk.Frame):
             dot, st = self.puntos[clave]
             if m.activo:
                 dot.config(fg=OK if self._parp < 10 else mezclar(OK, PANEL, 0.6))
-                st.config(text="Activo", fg=OK)
+                st.config(text=tr("Activo"), fg=OK)
             else:
                 dot.config(fg=BORDE)
-                st.config(text="Detenido", fg=SUB)
+                st.config(text=tr("Detenido"), fg=SUB)
 
     def config_actual(self):
         return {"mouse": self.mouse.obtener_config(), "teclado": self.teclado.obtener_config()}
 
 
-# ═════════════════════════════ APLICACION ═════════════════════════════════
 AJUSTES_DEF = {"hk_mouse": 0x75, "hk_teclado": 0x76, "hk_stop": 0x77, "retraso": 2, "encima": False,
                "esquina": True, "vigia": True}
 
@@ -2662,9 +2876,14 @@ AJUSTES_DEF = {"hk_mouse": 0x75, "hk_teclado": 0x76, "hk_stop": 0x77, "retraso":
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        global ESCALA, IDIOMA
+        self.local = Local()
+        aplicar_tema(self.local.datos.get("tema", "oscuro"))
+        IDIOMA = self.local.datos.get("idioma", "es")
+        SONIDO["on"] = bool(self.local.datos.get("sonido", True))
+        cargar_logo_cache(self.local)
         _CACHE.clear()
         _FUENTES.clear()
-        global ESCALA
         try:
             ESCALA = max(1.0, min(3.0, self.winfo_fpixels("1i") / 96.0)) if ES_WINDOWS else 1.0
         except Exception:
@@ -2677,7 +2896,7 @@ class App(tk.Tk):
         self.minsize(min(px(990), ancho), min(px(640), alto))
         self.configure(bg=BG)
         self._icono()
-        self.local = Local()
+        self.aplicar_titulo()
         self.cliente = ClienteAPI()
         self.toast = Toast(self)
         self.anim = Anim(self)
@@ -2685,9 +2904,9 @@ class App(tk.Tk):
         self.pantalla = None
         self.capa_update = None
         self.conexion_iniciada = False
-        self._auto_login = False      # hay un auto-login en curso
+        self._auto_login = False
         self._ultimo_refresco = 0.0
-        self.remota = self.local.datos.get("remota") or {}   # ultima config de GitHub guardada
+        self.remota = self.local.datos.get("remota") or {}
         self.cliente.usar(url_servidor(self.remota))
         self.motores = {"mouse": Motor(), "teclado": Motor()}
         self.cola_atajos = queue.Queue()
@@ -2702,8 +2921,8 @@ class App(tk.Tk):
             self.anim.run("alpha", 450, lambda t: self.attributes("-alpha", t))
         except tk.TclError:
             pass
-        # La config de GitHub se pide en segundo plano. Si ya hay una guardada, se conecta
-        # de inmediato con ella (arranque instantaneo) y luego se actualiza si cambio.
+
+
         threading.Thread(target=lambda: self.cola_ui.put((self._config_nueva, leer_config_remota(), False, None)),
                          daemon=True).start()
         if self.remota:
@@ -2711,7 +2930,7 @@ class App(tk.Tk):
         self._tick()
         self.after(60_000, self._latido)
 
-    # --- configuracion desde GitHub ---
+
     def _update_obligatoria(self):
         return bool(self.remota.get("obligatoria")) and \
             version_tupla(self.remota.get("version", "0")) > version_tupla(APP_VERSION)
@@ -2721,7 +2940,7 @@ class App(tk.Tk):
             return
         self.conexion_iniciada = True
         if isinstance(self.pantalla, PantallaAuth):
-            self.pantalla.verificar_servidor()   # al responder, intenta el auto-login
+            self.pantalla.verificar_servidor()
 
     def intentar_auto_login(self):
         tok = self.local.datos.get("token")
@@ -2737,7 +2956,7 @@ class App(tk.Tk):
 
         def fin_error(e):
             self._auto_login = False
-            if e.codigo in (401, 403):        # sesion vencida o cuenta suspendida
+            if e.codigo in (401, 403):
                 self.local.datos["token"] = None
                 self.local.guardar()
         self.api("GET", "/api/yo", None, fin_ok, fin_error)
@@ -2751,6 +2970,9 @@ class App(tk.Tk):
             self.cliente.usar(url_servidor(remota))
             if cambio and self.conexion_iniciada and isinstance(self.pantalla, PantallaAuth):
                 self.pantalla.verificar_servidor()
+            threading.Thread(target=lambda: sincronizar_logo(
+                remota, self.local, lambda: self.cola_ui.put((lambda _r: self._icono(), None, False, None))),
+                daemon=True).start()
         self._iniciar_conexion()
         if self.remota.get("anuncio"):
             self.after(1500, lambda: self.toast.mostrar(str(self.remota["anuncio"])[:120], "info", 6000))
@@ -2832,7 +3054,7 @@ class App(tk.Tk):
                 boton.set_habilitado(True)
                 boton.set_texto("Reintentar")
                 return self.lbl_desc.config(text=prog["fin"], fg=ERROR)
-            self.lbl_desc.config(text="Reiniciando…", fg=OK)
+            self.lbl_desc.config(text=tr("Reiniciando…"), fg=OK)
             self.after(400, lambda: self._reemplazar_exe(destino))
         threading.Thread(target=bajar, daemon=True).start()
         vigilar()
@@ -2869,14 +3091,59 @@ del "%~f0"
 
     def _icono(self):
         try:
-            im = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-            d = ImageDraw.Draw(im)
-            d.rounded_rectangle((0, 0, 63, 63), radius=16, fill=ACENTO)
-            d.polygon([(20, 14), (20, 50), (29, 41), (36, 54), (42, 51), (35, 38), (47, 38)], fill="#ffffff")
+            if LOGO["pil"] is not None:
+                im = ImageOps.fit(LOGO["pil"], (64, 64), Image.LANCZOS)
+            else:
+                im = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+                d = ImageDraw.Draw(im)
+                d.rounded_rectangle((0, 0, 63, 63), radius=16, fill=ACENTO)
+                d.polygon([(20, 14), (20, 50), (29, 41), (36, 54), (42, 51), (35, 38), (47, 38)], fill="#ffffff")
             self._ico = ImageTk.PhotoImage(im)
             self.iconphoto(True, self._ico)
         except Exception:
             pass
+
+    def aplicar_titulo(self):
+        if not ES_WINDOWS:
+            return
+        try:
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            dwm = ctypes.windll.dwmapi
+            modo = ctypes.c_int(1 if ES_OSCURO else 0)
+            for attr in (20, 19):
+                try:
+                    dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(modo), ctypes.sizeof(modo))
+                except Exception:
+                    pass
+
+            def col(hexc):
+                r, g, b = _rgb(hexc)
+                return ctypes.c_int(r | (g << 8) | (b << 16))
+            for attr, color in ((35, PANEL), (36, TEXTO), (34, BORDE)):
+                try:
+                    c = col(color)
+                    dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(c), 4)
+                except Exception:
+                    pass
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)
+        except Exception:
+            pass
+
+    def recargar(self, pagina=0):
+        aplicar_tema(self.local.datos.get("tema", "oscuro"))
+        self.configure(bg=BG)
+        self.aplicar_titulo()
+        self.toast = Toast(self)
+        if self.capa_update is not None:
+            self.capa_update = None
+        destino = PantallaPrincipal if isinstance(self.pantalla, PantallaPrincipal) else PantallaAuth
+        vieja = self.pantalla
+        kw = {"inicio": pagina} if destino is PantallaPrincipal else {}
+        self.pantalla = destino(self, **kw)
+        self.pantalla.place(x=0, y=0, relwidth=1, relheight=1)
+        if vieja is not None:
+            vieja.destroy()
 
     def _rueda(self, e):
         w = self.winfo_containing(e.x_root, e.y_root)
@@ -2885,7 +3152,7 @@ del "%~f0"
                 return w._rueda(e)
             w = getattr(w, "master", None)
 
-    # --- red (en segundo plano, sin congelar la ventana) ---
+
     def api(self, metodo, ruta, datos=None, ok=None, err=None, token=None):
         def trabajo():
             try:
@@ -2907,7 +3174,7 @@ del "%~f0"
         else:
             self.toast.mostrar(val.msg, "error")
 
-    # --- sesion ---
+
     def entrar(self, token, yo, recordar, nuevo=False):
         if not isinstance(self.pantalla, PantallaAuth):
             return
@@ -2917,11 +3184,10 @@ del "%~f0"
         if nuevo:
             self.toast.mostrar("Cuenta creada. ¡Bienvenido!", "ok")
         elif yo["acceso"]:
-            self.toast.mostrar(f"Hola, {yo['nombre']}", "ok")
+            self.toast.mostrar(tr("Hola, {n}", n=yo['nombre']), "ok")
         self.mostrar(PantallaPrincipal if yo["acceso"] else PantallaLicencia)
 
     def aplicar_yo(self, nuevo):
-        """Actualiza los datos de la cuenta y adapta la pantalla si cambio el acceso o el rol."""
         viejo, self.yo = self.yo, nuevo
         p = self.pantalla
         if not isinstance(p, PantallaPrincipal):
@@ -2933,7 +3199,7 @@ del "%~f0"
         elif viejo and viejo["rol"] != nuevo["rol"]:
             p.detener_todo(False)
             self.guardar_config()
-            self.mostrar(PantallaPrincipal)   # se reconstruye el panel con las secciones del nuevo rol
+            self.mostrar(PantallaPrincipal)
         else:
             p.refrescar_usuario()
 
@@ -2944,13 +3210,12 @@ del "%~f0"
         self.api("GET", "/api/yo", None, seguro(lambda r: self.aplicar_yo(r["yo"])), lambda e: None)
 
     def _latido(self):
-        # cada minuto: detecta baneos, licencias quitadas o cambios de rol
+
         if isinstance(self.pantalla, PantallaPrincipal):
             self.refrescar_yo()
         self.after(60_000, self._latido)
 
     def _revisar_vencimiento(self):
-        """Si la licencia vence mientras el programa esta abierto, se revisa al momento."""
         yo = self.yo
         if (yo and yo["rol"] == "user" and yo.get("vence") and yo["vence"] > 0 and yo["vence"] < time.time()
                 and time.monotonic() - self._ultimo_refresco > 10):
@@ -2974,7 +3239,7 @@ del "%~f0"
         self.yo = None
         self.mostrar(PantallaAuth, direccion=-1)
 
-    # --- pantallas (se deslizan) ---
+
     def mostrar(self, clase, direccion=1, **kw):
         vieja = self.pantalla
         nueva = clase(self, **kw)
@@ -2998,7 +3263,7 @@ del "%~f0"
         self.clipboard_append(texto)
         self.toast.mostrar(msg, "ok")
 
-    # --- configuracion local ---
+
     def ajustes(self):
         aj = self.local.cfg(self.yo["id"] if self.yo else 0).setdefault("ajustes", {})
         for k, v in AJUSTES_DEF.items():
@@ -3019,9 +3284,9 @@ del "%~f0"
             self.local.cfg(self.yo["id"]).update(self.pantalla.config_actual())
         self.local.guardar()
 
-    # --- bucle de la interfaz ---
+
     def _tick(self):
-        self.vigilante.latido_ui = time.monotonic()  # "la ventana sigue viva"
+        self.vigilante.latido_ui = time.monotonic()
         try:
             while not self.cola_ui.empty():
                 ok, val, es_err, err = self.cola_ui.get_nowait()
@@ -3030,7 +3295,7 @@ del "%~f0"
                 except tk.TclError:
                     pass
                 except Exception:
-                    self.report_callback_exception(*sys.exc_info())   # se registra y se sigue
+                    self.report_callback_exception(*sys.exc_info())
             p = self.pantalla
             if isinstance(p, PantallaPrincipal):
                 if not self.vigilante.atajos:
@@ -3042,7 +3307,7 @@ del "%~f0"
                     if ev == "stop":
                         p.detener_todo()
                     elif ev == "proteccion":
-                        p.detener_todo(False)  # el aviso con el motivo lo muestra cada pagina
+                        p.detener_todo(False)
                     else:
                         p.alternar(ev)
                 p.actualizar()
@@ -3061,20 +3326,19 @@ del "%~f0"
 
 
 def unica_instancia():
-    """Evita abrir el programa dos veces (los atajos se pelearian). Si ya esta abierto, lo trae al frente."""
     if not ES_WINDOWS:
         return True
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateMutexW.restype = wintypes.HANDLE
     k32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
     globals()["_MUTEX"] = k32.CreateMutexW(None, False, "Local\\AutoClickerAL_unico")
-    if ctypes.get_last_error() != 183:          # ERROR_ALREADY_EXISTS
+    if ctypes.get_last_error() != 183:
         return True
     user32.FindWindowW.restype = wintypes.HWND
     user32.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
     hwnd = user32.FindWindowW(None, APP_NOMBRE)
     if hwnd:
-        user32.ShowWindow(hwnd, 9)               # SW_RESTORE
+        user32.ShowWindow(hwnd, 9)
         user32.SetForegroundWindow(hwnd)
     return False
 

@@ -1,4 +1,3 @@
-"""Pruebas del servidor (cualquier sistema). Uso: python pruebas/prueba_servidor.py"""
 import hashlib
 import http.client
 import json
@@ -72,7 +71,7 @@ def main():
         s, r = c("GET", "/api/ping")
         comprobar(s == 200 and r["ok"], "ping")
 
-        # --- registro y login ---
+
         s, r = c("POST", "/api/registro", {"usuario": "Dueno", "pw": ph("Dueno", "secreto1")})
         comprobar(s == 200 and r["yo"]["id"] == 1000 and r["yo"]["rol"] == "owner", "el primer usuario es owner #1000")
         owner = Cliente(puerto)
@@ -88,7 +87,7 @@ def main():
         s, r = c("POST", "/api/login", {"usuario": "noexiste", "pw": ph("noexiste", "mal")})
         comprobar(s == 400 and r["error"] == "Usuario o contraseña incorrectos", "usuario inexistente: mismo mensaje")
 
-        # --- registros simultaneos con el mismo nombre ---
+
         resultados = []
 
         def reg():
@@ -99,7 +98,7 @@ def main():
         comprobar(sorted(resultados).count(200) == 1 and 500 not in resultados,
                   f"5 registros simultáneos: 1 éxito, sin errores 500 ({sorted(resultados)})")
 
-        # --- conexion persistente (keep-alive) ---
+
         t0 = time.perf_counter()
         for _ in range(20):
             owner("GET", "/api/yo")
@@ -111,7 +110,7 @@ def main():
         s, r = owner("POST", "/api/canjear", None)
         comprobar(s == 400, "petición sin cuerpo no rompe el servidor")
 
-        # --- licencias ---
+
         s, r = owner("POST", "/api/admin/generar", {"cantidad": 3, "duracion": 86400, "nota": "prueba"})
         comprobar(s == 200 and len(r["claves"]) == 3, "generar 3 licencias de 1 día")
         claves = r["claves"]
@@ -132,7 +131,7 @@ def main():
         s, r = amigo("POST", "/api/canjear", {"clave": claves[0]})
         comprobar(s == 400 and "usada" in r["error"], "licencia de un solo uso")
 
-        # canjes simultaneos de 2 licencias: el tiempo se debe sumar completo
+
         res = []
 
         def canjear(k):
@@ -153,7 +152,7 @@ def main():
         s, r = amigo("POST", "/api/admin/usuario", {"id": 1000, "accion": "banear"})
         comprobar(s == 403, "un admin no puede banear al owner")
 
-        # --- acciones del owner ---
+
         s, r = owner("POST", "/api/admin/usuario", {"id": 1000, "accion": "banear"})
         comprobar(s == 400, "el owner no puede banearse a sí mismo")
         uid_amigo = r_amigo = None
@@ -177,7 +176,7 @@ def main():
         comprobar(s == 200, "desbanear")
         amigo.token = r["token"]
 
-        # --- cambiar contraseña ---
+
         otra = Cliente(puerto)
         otra.token = amigo("POST", "/api/login", {"usuario": "amigo", "pw": ph("amigo", "123456")})[1]["token"]
         s, r = amigo("POST", "/api/cambiar_pw", {"actual": ph("amigo", "mal"), "nueva": ph("amigo", "nueva123")})
@@ -189,7 +188,7 @@ def main():
         s, r = amigo("POST", "/api/login", {"usuario": "amigo", "pw": ph("amigo", "nueva123")})
         comprobar(s == 200, "entrar con la contraseña nueva")
 
-        # --- la licencia borrada ---
+
         s, r = owner("POST", "/api/admin/generar", {"cantidad": 1, "duracion": 3600})
         k = r["claves"][0]
         s, r = owner("POST", "/api/admin/borrar_licencia", {"clave": k})
@@ -197,7 +196,7 @@ def main():
         s, r = amigo("POST", "/api/canjear", {"clave": k})
         comprobar(s == 400, "una licencia borrada ya no sirve")
 
-        # --- tokens guardados cifrados ---
+
         import sqlite3
         con = sqlite3.connect(os.path.join(carpeta, "datos.db"))
         guardados = {t for (t,) in con.execute("SELECT token FROM sesiones")}
@@ -205,7 +204,7 @@ def main():
         comprobar(owner.token not in guardados and hashlib.sha256(owner.token.encode()).hexdigest() in guardados,
                   "los tokens se guardan cifrados")
 
-        # --- limite de intentos ---
+
         malo = Cliente(puerto)
         codigos = [malo("POST", "/api/login", {"usuario": "Dueno", "pw": ph("Dueno", f"x{i}")})[0] for i in range(13)]
         comprobar(codigos[-1] == 429, "límite de intentos fallidos")
@@ -216,7 +215,7 @@ def main():
                   headers={"X-Forwarded-For": "1.2.3.4", "Content-Type": "application/json"})
         comprobar(h.getresponse().status == 429, "no se puede saltar el límite con X-Forwarded-For")
 
-        # --- peticiones raras ---
+
         h = http.client.HTTPConnection("127.0.0.1", puerto, timeout=5)
         h.request("POST", "/api/login", body=b"{no es json", headers={"Content-Type": "application/json"})
         comprobar(h.getresponse().status == 400, "JSON inválido -> 400")
@@ -236,7 +235,7 @@ def main():
     if "ERROR" in salida:
         print(salida)
 
-    # --- migracion: base de datos de la version anterior ---
+
     viejo = os.path.join(RAIZ, "pruebas", "datos_v22.db")
     if os.path.exists(viejo):
         carpeta2 = tempfile.mkdtemp()
@@ -246,7 +245,7 @@ def main():
         srv = arrancar(carpeta2, p2)
         try:
             c = Cliente(p2)
-            c.token = "a" * 64   # token guardado sin cifrar por la v2.2
+            c.token = "a" * 64
             s, r = c("GET", "/api/yo")
             comprobar(s == 200 and r["yo"]["nombre"] == "Viejo", "migración: la sesión de la versión anterior sigue válida")
             s, r = c("GET", "/api/yo")

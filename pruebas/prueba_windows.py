@@ -180,6 +180,26 @@ comprobar(esperar(lambda: isinstance(app.pantalla, A.PantallaPrincipal) and app.
                   and len(app.pantalla.paginas) == 5, 6), "con licencia de admin el panel muestra 5 secciones")
 bombear(0.8)
 
+# tema claro e inglés
+P = app.pantalla
+P.ir(len(P.paginas) - 1)
+bombear(0.6)
+C = P.paginas[-1]
+C._tema("claro")
+comprobar(esperar(lambda: A.TEMA == "claro" and isinstance(app.pantalla, A.PantallaPrincipal)), "cambio a tema claro")
+bombear(1.0)
+captura("tema_claro")
+app.pantalla.paginas[-1]._idioma("en")
+comprobar(esperar(lambda: A.IDIOMA == "en" and isinstance(app.pantalla, A.PantallaPrincipal)), "cambio a inglés")
+app.pantalla.ir(0)
+bombear(1.0)
+captura("ingles_claro")
+comprobar(A.tr("Mouse") == "Mouse" and A.tr("Cuenta") == "Account", "textos traducidos a inglés")
+app.pantalla.paginas[-1]._tema("oscuro")
+bombear(0.6)
+app.pantalla.paginas[-1]._idioma("es")
+bombear(0.6)
+
 # aviso de actualizacion
 app.remota = dict(app.remota, version="99.0", notas="Prueba de actualización")
 app._ofrecer_actualizacion()

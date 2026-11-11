@@ -1,16 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-AutoClicker AL - Servidor de cuentas y licencias.
-
-Solo usa la libreria estandar de Python (3.9+). Se ejecuta con:  python servidor/app.py
-
-Configuracion (archivo servidor/.env o variables de entorno):
-    OWNER_IDS=1000          IDs con control total (separados por coma)
-    ADMIN_IDS=1001,1002     IDs admin permanentes
-    PORT=                   puerto (si se deja vacio usa SERVER_PORT del panel)
-    TRUST_PROXY=0           pon 1 solo si hay un proxy delante que envia X-Forwarded-For
-Los cambios de OWNER_IDS / ADMIN_IDS en el .env se aplican solos, sin reiniciar.
-"""
 import hashlib
 import hmac
 import json
@@ -34,11 +22,11 @@ RUTA_ENV = os.path.join(BASE, ".env")
 RUTA_DB = os.path.join(BASE, "datos.db")
 DIR_RESPALDOS = os.path.join(BASE, "respaldos")
 
-POR_VIDA = -1                      # duracion / vencimiento "de por vida"
-SESION_SEG = 30 * 86400            # una sesion dura 30 dias (se renueva sola con el uso)
-MAX_SESIONES = 10                  # sesiones abiertas por cuenta (PCs distintas)
-MAX_CUERPO = 64 * 1024             # tamaño maximo de una peticion
-ITERACIONES = 100_000              # PBKDF2
+POR_VIDA = -1
+SESION_SEG = 30 * 86400
+MAX_SESIONES = 10
+MAX_CUERPO = 64 * 1024
+ITERACIONES = 100_000
 RE_USUARIO = re.compile(r"[A-Za-z0-9_.\-]{3,20}")
 RE_PREHASH = re.compile(r"[0-9a-f]{64}")
 
@@ -47,7 +35,6 @@ def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
-# ═══════════════════════════════ .env ════════════════════════════════════
 def leer_env():
     vals = {}
     try:
@@ -71,7 +58,6 @@ _env_lock = threading.Lock()
 
 
 def _env_actual():
-    """Relee el .env solo si cambio (agregar admins no requiere reiniciar)."""
     try:
         mt = os.path.getmtime(RUTA_ENV)
     except OSError:
@@ -90,18 +76,16 @@ def _env_actual():
 
 
 def roles_env():
-    """(owners, admins)"""
     return _env_actual()["roles"]
 
 
-# ═══════════════════════════ base de datos ═══════════════════════════════
-db = sqlite3.connect(RUTA_DB, check_same_thread=False, isolation_level=None)  # autocommit
+db = sqlite3.connect(RUTA_DB, check_same_thread=False, isolation_level=None)
 db.row_factory = sqlite3.Row
 lock = threading.RLock()
 
 
 def _preparar_db():
-    db.execute("PRAGMA journal_mode=WAL")       # lecturas y escrituras sin bloquearse
+    db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
     db.execute("PRAGMA foreign_keys=ON")
     db.executescript("""
@@ -122,7 +106,7 @@ def _preparar_db():
     CREATE INDEX IF NOT EXISTS idx_lic_usada_por ON licencias(usada_por);
     CREATE INDEX IF NOT EXISTS idx_ses_uid ON sesiones(uid);
     """)
-    # los IDs de usuario empiezan en 1000
+
     db.execute("INSERT INTO sqlite_sequence(name, seq) SELECT 'usuarios', 999 "
                "WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name='usuarios')")
 
@@ -148,7 +132,6 @@ def escribir(sql, args=()):
 
 @contextmanager
 def transaccion():
-    """Bloque atomico: o se aplica todo, o nada."""
     with lock:
         db.execute("BEGIN IMMEDIATE")
         try:
@@ -164,7 +147,6 @@ def usuario_por_id(uid):
     return leer1("SELECT * FROM usuarios WHERE id=?", (uid,))
 
 
-# ═══════════════════════════ reglas de negocio ═══════════════════════════
 def activo(v):
     return v is not None and (v == POR_VIDA or v > time.time())
 
@@ -196,7 +178,6 @@ def info(u, roles=None):
 
 
 def puede_modificar(actor, objetivo, roles):
-    """Owner: a cualquiera menos a otro owner. Admin: solo a usuarios normales y a si mismo."""
     r_actor, r_obj = rol_de(actor, roles), rol_de(objetivo, roles)
     if r_obj == "owner":
         return False
@@ -213,7 +194,7 @@ _SALT_FALSO = secrets.token_hex(16)
 
 
 def nueva_clave():
-    alf = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # sin 0/O/1/I para evitar confusiones
+    alf = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     s = "".join(secrets.choice(alf) for _ in range(16))
     return "AL-" + "-".join(s[i:i + 4] for i in range(0, 16, 4))
 
@@ -229,9 +210,7 @@ def hash_token(tok):
     return hashlib.sha256(tok.encode()).hexdigest()
 
 
-# ═══════════════════════ limites de intentos ═════════════════════════════
 class Limite:
-    """Cuenta eventos por IP en una ventana de tiempo (seguro entre hilos)."""
 
     def __init__(self, maximo, ventana):
         self.maximo, self.ventana = maximo, ventana
@@ -261,11 +240,10 @@ class Limite:
                 self._vigentes(clave, ahora)
 
 
-FALLOS = Limite(12, 600)        # 12 contraseñas/licencias incorrectas cada 10 min
-REGISTROS = Limite(6, 3600)     # 6 cuentas nuevas por hora por IP
+FALLOS = Limite(12, 600)
+REGISTROS = Limite(6, 3600)
 
 
-# ═══════════════════════════════ API ═════════════════════════════════════
 class Err(Exception):
     def __init__(self, msg, code=400):
         super().__init__(msg)
@@ -311,7 +289,7 @@ def api_login(d, ctx):
         raise Err("Demasiados intentos. Espera unos minutos.", 429)
     u = leer1("SELECT * FROM usuarios WHERE nombre=?", (_texto(d, "usuario"),))
     pw = _texto(d, "pw")
-    # se calcula el hash aunque el usuario no exista: asi no se puede adivinar quien existe
+
     calculado = pbkdf2(pw, u["salt"] if u else _SALT_FALSO)
     if not u or not hmac.compare_digest(calculado, u["hash"]):
         FALLOS.anotar(ctx["ip"])
@@ -325,7 +303,7 @@ def api_yo(d, ctx):
     u, ahora = ctx["u"], time.time()
     if not u["visto"] or ahora - u["visto"] > 60:
         escribir("UPDATE usuarios SET visto=? WHERE id=?", (ahora, u["id"]))
-    if ctx["sesion"]["vence"] - ahora < SESION_SEG / 2:   # sesion deslizante
+    if ctx["sesion"]["vence"] - ahora < SESION_SEG / 2:
         escribir("UPDATE sesiones SET vence=? WHERE token=?", (ahora + SESION_SEG, ctx["sesion"]["token"]))
     return {"yo": info(u)}
 
@@ -348,7 +326,7 @@ def api_cambiar_pw(d, ctx):
     salt = secrets.token_hex(16)
     with transaccion():
         db.execute("UPDATE usuarios SET salt=?, hash=? WHERE id=?", (salt, pbkdf2(nueva, salt), u["id"]))
-        # cierra la sesion en las demas PCs
+
         db.execute("DELETE FROM sesiones WHERE uid=? AND token<>?", (u["id"], ctx["sesion"]["token"]))
     return {"ok": True}
 
@@ -365,7 +343,7 @@ def api_canjear(d, ctx):
             raise Err("Licencia inválida")
         if lic["usada_por"]:
             raise Err("Esta licencia ya fue usada")
-        u = db.execute("SELECT * FROM usuarios WHERE id=?", (uid,)).fetchone()  # datos frescos
+        u = db.execute("SELECT * FROM usuarios WHERE id=?", (uid,)).fetchone()
         if lic["tipo"] == "admin":
             db.execute("UPDATE usuarios SET admin_vence=? WHERE id=?", (POR_VIDA, uid))
         else:
@@ -480,7 +458,6 @@ def api_usuario(d, ctx):
     return {"ok": True, "usuario": info(usuario_por_id(oid), roles)}
 
 
-# (metodo, ruta) -> (funcion, nivel)    nivel: publico | sesion | admin
 RUTAS = {
     ("GET", "/api/ping"): (lambda d, ctx: {"ok": True, "version": VERSION}, "publico"),
     ("POST", "/api/registro"): (api_registro, "publico"),
@@ -503,7 +480,7 @@ def autenticar(headers):
         raise Err("Sesión expirada. Inicia sesión de nuevo.", 401)
     h = hash_token(tok)
     s = leer1("SELECT * FROM sesiones WHERE token IN (?, ?)", (h, tok))
-    if s and s["token"] == tok:  # sesion de una version anterior (sin cifrar): se migra
+    if s and s["token"] == tok:
         escribir("UPDATE sesiones SET token=? WHERE token=?", (h, tok))
         s = leer1("SELECT * FROM sesiones WHERE token=?", (h,))
     if not s or s["vence"] < time.time():
@@ -518,9 +495,9 @@ def autenticar(headers):
 
 class Manejador(BaseHTTPRequestHandler):
     server_version = "AutoClickerAL/" + VERSION
-    protocol_version = "HTTP/1.1"   # mantiene la conexion abierta: respuestas mucho mas rapidas
-    timeout = 20                    # cierra conexiones inactivas o lentas
-    disable_nagle_algorithm = True  # sin esperas de 40 ms entre cabecera y cuerpo
+    protocol_version = "HTTP/1.1"
+    timeout = 20
+    disable_nagle_algorithm = True
 
     def _responder(self, code, obj):
         cuerpo = json.dumps(obj, ensure_ascii=False).encode()
@@ -542,7 +519,7 @@ class Manejador(BaseHTTPRequestHandler):
         if largo < 0 or largo > MAX_CUERPO:
             self.close_connection = True
             raise Err("Petición muy grande", 413)
-        crudo = self.rfile.read(largo) if largo else b""   # siempre se lee: la conexion queda limpia
+        crudo = self.rfile.read(largo) if largo else b""
         if not crudo:
             return {}
         try:
@@ -580,7 +557,7 @@ class Manejador(BaseHTTPRequestHandler):
             self._responder(e.code, {"error": e.msg})
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
-        except Exception:  # nunca tumbar el servidor
+        except Exception:
             log("ERROR\n" + traceback.format_exc())
             self.close_connection = True
             try:
@@ -598,9 +575,7 @@ class Manejador(BaseHTTPRequestHandler):
         pass
 
 
-# ═══════════════════════ tareas de mantenimiento ═════════════════════════
 def respaldar():
-    """Copia de seguridad de la base de datos (se guardan las 7 mas recientes)."""
     os.makedirs(DIR_RESPALDOS, exist_ok=True)
     destino = os.path.join(DIR_RESPALDOS, f"datos-{datetime.now():%Y%m%d-%H%M}.db")
     copia = sqlite3.connect(destino)
@@ -635,7 +610,7 @@ class Servidor(ThreadingHTTPServer):
     daemon_threads = True
 
     def handle_error(self, request, client_address):
-        # un cliente que cierra la conexion (PC apagada, sin internet) no es un error del servidor
+
         tipo = sys.exc_info()[0]
         if tipo and issubclass(tipo, (ConnectionError, TimeoutError)):
             return
