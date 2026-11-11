@@ -50,10 +50,14 @@ teclas = []
 root.bind("<KeyPress-a>", lambda e: teclas.append(("down", e.time)))
 root.bind("<KeyRelease-a>", lambda e: teclas.append(("up", e.time)))
 root.focus_force(); root.update()
-for _ in range(5):
-    A.presionar_tecla(0x41, 40)
-    time.sleep(0.05)
-    root.update()
+def teclear():   # en otro hilo, como el programa real, mientras la ventana procesa eventos
+    for _ in range(5):
+        A.presionar_tecla(0x41, 40)
+        time.sleep(0.06)
+hilo = threading.Thread(target=teclear)
+hilo.start()
+while hilo.is_alive():
+    root.update(); time.sleep(0.002)
 for _ in range(20):
     root.update(); time.sleep(0.01)
 downs = [t for k, t in teclas if k == "down"]
@@ -126,7 +130,7 @@ latir(3)
 # d) ventana congelada (no se actualiza el latido)
 motores["teclado"].iniciar(lambda p: p.wait(0.01), 0.05)
 latir(0.3)
-time.sleep(5.5)  # la "ventana" no responde
+time.sleep(9.5)  # la "ventana" no responde (el limite es 8 s)
 comprobar(not motores["teclado"].activo, "ventana congelada: el motor se detuvo")
 comprobar("ventana" in (motores["teclado"].error or ""), f"ventana congelada: motivo = {motores['teclado'].error!r}")
 
